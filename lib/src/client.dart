@@ -192,9 +192,28 @@ class Client {
   ) async {
     final response = await http
         .get('https://${MatrixIdOrDomain.domain}/.well-known/matrix/client');
-    final rawJson = json.decode(response.body);
-    return WellKnownInformations.fromJson(rawJson);
+    WellKnownInformations wellKnown = WellKnownInformations.fromJson(json.decode(response.body));
+    if (Uri.parse(wellKnown.mHomeserver.baseUrl).host != MatrixIdOrDomain.domain) {
+      final response = await http
+        .get('https://${Uri.parse(wellKnown.mHomeserver.baseUrl).host}/.well-known/matrix/client');
+      wellKnown = WellKnownInformations.fromJson(json.decode(response.body));
+    }
+    return wellKnown;
   }
+
+  Future<WellKnownInformations> getWellKnownInformationsByDomain(dynamic serverUrl) async {
+    Uri homeserver = (serverUrl is Uri) ? serverUrl : Uri.parse(serverUrl);
+    final response = await http
+        .get('https://${homeserver.host}/.well-known/matrix/client');
+    WellKnownInformations wellKnown = WellKnownInformations.fromJson(json.decode(response.body));
+    if (Uri.parse(wellKnown.mHomeserver.baseUrl).host != homeserver.host) {
+      final response = await http
+        .get('https://${Uri.parse(wellKnown.mHomeserver.baseUrl).host}/.well-known/matrix/client');
+      wellKnown = WellKnownInformations.fromJson(json.decode(response.body));
+    } 
+    return wellKnown;
+  }
+
 
   /// Checks the supported versions of the Matrix protocol and the supported
   /// login types. Returns false if the server is not compatible with the
