@@ -1,4 +1,4 @@
-+++ This SDK is under development and highly experimental +++
++++ This is a fork of famedlysdk to statisfy FurryChat (fork of FluffyChat) needs +++
 
 # famedlysdk
 
