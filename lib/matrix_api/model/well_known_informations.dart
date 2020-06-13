@@ -19,6 +19,7 @@
 class WellKnownInformations {
   MHomeserver mHomeserver;
   MHomeserver mIdentityServer;
+  JitsiHomeserver jitsiHomeserver;
   Map<String, dynamic> content;
 
   WellKnownInformations.fromJson(Map<String, dynamic> json) {
@@ -28,6 +29,9 @@ class WellKnownInformations {
         : null;
     mIdentityServer = json['m.identity_server'] != null
         ? MHomeserver.fromJson(json['m.identity_server'])
+        : null;
+    jitsiHomeserver = json['im.vector.riot.jitsi'] != null 
+        ? JitsiHomeserver.fromJson(json['im.vector.riot.jitsi'])
         : null;
   }
 
@@ -49,6 +53,20 @@ class MHomeserver {
   Map<String, dynamic> toJson() {
     final data = <String, dynamic>{};
     data['base_url'] = baseUrl;
+    return data;
+  }
+}
+
+class JitsiHomeserver {
+  String baseUrl;
+
+  JitsiHomeserver.fromJson(Map<String, dynamic> json) {
+    baseUrl = json['preferredDomain'];
+  }
+
+  Map<String, dynamic> toJson() {
+    final data = <String, dynamic>{};
+    data['preferredDomain'] = baseUrl;
     return data;
   }
 }
