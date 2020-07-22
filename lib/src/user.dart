@@ -71,7 +71,10 @@ class User extends Event {
   String get id => stateKey;
 
   /// The displayname of the user if the user has set one.
-  String get displayName => content != null ? content['displayname'] : null;
+  String get displayName =>
+      content != null && content.containsKey('displayname')
+          ? content['displayname']
+          : (prevContent != null ? prevContent['displayname'] : null);
 
   /// Returns the power level of this user.
   int get powerLevel => room?.getPowerLevelByUserId(id);
@@ -89,19 +92,26 @@ class User extends Event {
       }, orElse: () => Membership.join);
 
   /// The avatar if the user has one.
-  Uri get avatarUrl => content != null && content['avatar_url'] is String
-      ? Uri.parse(content['avatar_url'])
-      : null;
+  Uri get avatarUrl => content != null && content.containsKey('avatar_url')
+      ? (content['avatar_url'] is String
+          ? Uri.parse(content['avatar_url'])
+          : null)
+      : (prevContent != null && prevContent['avatar_url'] is String
+          ? Uri.parse(prevContent['avatar_url'])
+          : null);
 
   /// Returns the displayname or the local part of the Matrix ID if the user
   /// has no displayname. If [formatLocalpart] is true, then the localpart will
   /// be formatted in the way, that all "_" characters are becomming white spaces and
   /// the first character of each word becomes uppercase.
-  String calcDisplayname({bool formatLocalpart = true}) {
+  /// If [mxidLocalPartFallback] is true, then the local part of the mxid will be shown
+  /// if there is no other displayname available. If not then this will return "Unknown user".
+  String calcDisplayname(
+      {bool formatLocalpart = true, bool mxidLocalPartFallback = true}) {
     if (displayName?.isNotEmpty ?? false) {
       return displayName;
     }
-    if (stateKey != null) {
+    if (stateKey != null && mxidLocalPartFallback) {
       if (!formatLocalpart) {
         return stateKey.localpart;
       }
@@ -113,7 +123,7 @@ class User extends Event {
       }
       return words.join(' ');
     }
-    return 'Unknown User';
+    return 'Unknown user';
   }
 
   /// Call the Matrix API to kick this user from this room.

@@ -150,6 +150,19 @@ void main() {
           content: {'url': 'mxc://testurl'},
           stateKey: '');
       expect(room.avatar.toString(), 'mxc://testurl');
+
+      expect(room.pinnedEventIds, <String>[]);
+      room.states['m.room.pinned_events'] = Event(
+          senderId: '@test:example.com',
+          type: 'm.room.pinned_events',
+          roomId: room.id,
+          room: room,
+          eventId: '123',
+          content: {
+            'pinned': ['1234']
+          },
+          stateKey: '');
+      expect(room.pinnedEventIds.first, '1234');
       room.states['m.room.message'] = Event(
           senderId: '@test:example.com',
           type: 'm.room.message',
@@ -287,6 +300,9 @@ void main() {
     });
 
     test('getParticipants', () async {
+      var userList = room.getParticipants();
+      expect(userList.length, 4);
+      // add new user
       room.setState(Event(
           senderId: '@alice:test.abc',
           type: 'm.room.member',
@@ -296,9 +312,9 @@ void main() {
           originServerTs: DateTime.now(),
           content: {'displayname': 'alice'},
           stateKey: '@alice:test.abc'));
-      final userList = room.getParticipants();
-      expect(userList.length, 4);
-      expect(userList[3].displayName, 'alice');
+      userList = room.getParticipants();
+      expect(userList.length, 5);
+      expect(userList[4].displayName, 'alice');
     });
 
     test('addToDirectChat', () async {
@@ -320,8 +336,7 @@ void main() {
     });
 
     test('setAvatar', () async {
-      final testFile =
-          MatrixFile(bytes: Uint8List(0), path: 'fake/path/file.jpeg');
+      final testFile = MatrixFile(bytes: Uint8List(0), name: 'file.jpeg');
       final dynamic resp = await room.setAvatar(testFile);
       expect(resp, 'YUwRidLecu:example.com');
     });
@@ -348,10 +363,8 @@ void main() {
     });*/
 
     test('sendFileEvent', () async {
-      final testFile =
-          MatrixFile(bytes: Uint8List(0), path: 'fake/path/file.jpeg');
-      final dynamic resp = await room.sendFileEvent(testFile,
-          msgType: 'm.file', txid: 'testtxid');
+      final testFile = MatrixFile(bytes: Uint8List(0), name: 'file.jpeg');
+      final dynamic resp = await room.sendFileEvent(testFile, txid: 'testtxid');
       expect(resp, 'mxc://example.com/AQwafuaFswefuhsfAFAgsw');
     });
 
@@ -394,6 +407,25 @@ void main() {
       await room.answerCall('1234', 'sdp', txid: '1234');
       await room.hangupCall('1234', txid: '1234');
       await room.sendCallCandidates('1234', [], txid: '1234');
+    });
+
+    test('Test tag methods', () async {
+      await room.addTag(TagType.Favourite, order: 0.1);
+      await room.removeTag(TagType.Favourite);
+      expect(room.isFavourite, false);
+      room.roomAccountData['m.tag'] = BasicRoomEvent.fromJson({
+        'content': {
+          'tags': {
+            'm.favourite': {'order': 0.1},
+            'm.wrong': {'order': 0.2},
+          }
+        },
+        'type': 'm.tag'
+      });
+      expect(room.tags.length, 1);
+      expect(room.tags[TagType.Favourite].order, 0.1);
+      expect(room.isFavourite, true);
+      await room.setFavourite(false);
     });
 
     test('joinRules', () async {

@@ -20,9 +20,9 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:core';
 
+import 'package:famedlysdk/encryption.dart';
 import 'package:famedlysdk/famedlysdk.dart';
 import 'package:famedlysdk/matrix_api.dart';
-import 'package:famedlysdk/encryption.dart';
 import 'package:famedlysdk/src/room.dart';
 import 'package:famedlysdk/src/utils/device_keys_list.dart';
 import 'package:famedlysdk/src/utils/matrix_file.dart';
@@ -30,12 +30,12 @@ import 'package:famedlysdk/src/utils/to_device_event.dart';
 import 'package:http/http.dart' as http;
 import 'package:pedantic/pedantic.dart';
 
+import 'database/database.dart' show Database;
 import 'event.dart';
 import 'room.dart';
+import 'user.dart';
 import 'utils/event_update.dart';
 import 'utils/room_update.dart';
-import 'user.dart';
-import 'database/database.dart' show Database;
 
 typedef RoomSorter = int Function(Room a, Room b);
 
@@ -56,16 +56,50 @@ class Client {
 
   Encryption encryption;
 
+  Set<KeyVerificationMethod> verificationMethods;
+
+  Set<String> importantStateEvents;
+
   /// Create a client
   /// clientName = unique identifier of this client
   /// debug: Print debug output?
   /// database: The database instance to use
   /// enableE2eeRecovery: Enable additional logic to try to recover from bad e2ee sessions
+  /// verificationMethods: A set of all the verification methods this client can handle. Includes:
+  ///    KeyVerificationMethod.numbers: Compare numbers. Most basic, should be supported
+  ///    KeyVerificationMethod.emoji: Compare emojis
+  /// importantStateEvents: A set of all the important state events to load when the client connects.
+  ///    To speed up performance only a set of state events is loaded on startup, those that are
+  ///    needed to display a room list. All the remaining state events are automatically post-loaded
+  ///    when opening the timeline of a room or manually by calling `room.postLoad()`.
+  ///    This set will always include the following state events:
+  ///     - m.room.name
+  ///     - m.room.avatar
+  ///     - m.room.message
+  ///     - m.room.encrypted
+  ///     - m.room.encryption
+  ///     - m.room.canonical_alias
+  ///     - m.room.tombstone
+  ///     - *some* m.room.member events, where needed
   Client(this.clientName,
       {this.debug = false,
       this.database,
       this.enableE2eeRecovery = false,
-      http.Client httpClient}) {
+      this.verificationMethods,
+      http.Client httpClient,
+      this.importantStateEvents,
+      this.pinUnreadRooms = false}) {
+    verificationMethods ??= <KeyVerificationMethod>{};
+    importantStateEvents ??= <String>{};
+    importantStateEvents.addAll([
+      EventTypes.RoomName,
+      EventTypes.RoomAvatar,
+      EventTypes.Message,
+      EventTypes.Encrypted,
+      EventTypes.Encryption,
+      EventTypes.RoomCanonicalAlias,
+      EventTypes.RoomTombstone,
+    ]);
     api = MatrixApi(debug: debug, httpClient: httpClient);
     onLoginStateChanged.stream.listen((loginState) {
       if (debug) {
@@ -110,6 +144,12 @@ class Client {
 
   String get identityKey => encryption?.identityKey ?? '';
   String get fingerprintKey => encryption?.fingerprintKey ?? '';
+
+  /// Wheather this session is unknown to others
+  bool get isUnknownSession =>
+      !userDeviceKeys.containsKey(userID) ||
+      !userDeviceKeys[userID].deviceKeys.containsKey(deviceID) ||
+      !userDeviceKeys[userID].deviceKeys[deviceID].signed;
 
   /// Warning! This endpoint is for testing only!
   set rooms(List<Room> newList) {
@@ -168,13 +208,12 @@ class Client {
     if (accountData['m.direct'] != null &&
         accountData['m.direct'].content[userId] is List<dynamic> &&
         accountData['m.direct'].content[userId].length > 0) {
-      if (getRoomById(accountData['m.direct'].content[userId][0]) != null) {
-        return accountData['m.direct'].content[userId][0];
+      for (final roomId in accountData['m.direct'].content[userId]) {
+        final room = getRoomById(roomId);
+        if (room != null && room.membership == Membership.join) {
+          return roomId;
+        }
       }
-      (accountData['m.direct'].content[userId] as List<dynamic>)
-          .remove(accountData['m.direct'].content[userId][0]);
-      api.setAccountData(userId, 'm.direct', directChats);
-      return getDirectChatFromUserId(userId);
     }
     for (var i = 0; i < rooms.length; i++) {
       if (rooms[i].membership == Membership.invite &&
@@ -427,36 +466,13 @@ class Client {
     return archiveList;
   }
 
-  /// Loads the contact list for this user excluding the user itself.
-  /// Currently the contacts are found by discovering the contacts of
-  /// the famedlyContactDiscovery room, which is
-  /// defined by the autojoin room feature in Synapse.
-  Future<List<User>> loadFamedlyContacts() async {
-    var contacts = <User>[];
-    var contactDiscoveryRoom =
-        getRoomByAlias('#famedlyContactDiscovery:${userID.domain}');
-    if (contactDiscoveryRoom != null) {
-      contacts = await contactDiscoveryRoom.requestParticipants();
-    } else {
-      var userMap = <String, bool>{};
-      for (var i = 0; i < rooms.length; i++) {
-        var roomUsers = rooms[i].getParticipants();
-        for (var j = 0; j < roomUsers.length; j++) {
-          if (userMap[roomUsers[j].id] != true) contacts.add(roomUsers[j]);
-          userMap[roomUsers[j].id] = true;
-        }
-      }
-    }
-    return contacts;
-  }
-
   /// Changes the user's displayname.
   Future<void> setDisplayname(String displayname) =>
       api.setDisplayname(userID, displayname);
 
   /// Uploads a new user avatar for this user.
   Future<void> setAvatar(MatrixFile file) async {
-    final uploadResp = await api.upload(file.bytes, file.path);
+    final uploadResp = await api.upload(file.bytes, file.name);
     await api.setAvatarUrl(userID, Uri.parse(uploadResp));
     return;
   }
@@ -647,11 +663,11 @@ class Client {
           encryption?.pickledOlmAccount,
         );
       }
-      _userDeviceKeys = await database.getUserDeviceKeys(id);
+      _userDeviceKeys = await database.getUserDeviceKeys(this);
       _rooms = await database.getRoomList(this, onlyLeft: false);
       _sortRooms();
       accountData = await database.getAccountData(id);
-      presences = await database.getPresences(id);
+      presences.clear();
     }
 
     onLoginStateChanged.add(LoginState.logged);
@@ -676,18 +692,25 @@ class Client {
   }
 
   Future<SyncUpdate> _syncRequest;
+  Exception _lastSyncError;
 
   Future<void> _sync() async {
     if (isLogged() == false || _disposed) return;
     try {
-      _syncRequest = api.sync(
+      _syncRequest = api
+          .sync(
         filter: syncFilters,
         since: prevBatch,
         timeout: prevBatch != null ? 30000 : null,
-      );
+      )
+          .catchError((e) {
+        _lastSyncError = e;
+        return null;
+      });
       if (_disposed) return;
       final hash = _syncRequest.hashCode;
       final syncResp = await _syncRequest;
+      if (syncResp == null) throw _lastSyncError;
       if (hash != _syncRequest.hashCode) return;
       if (database != null) {
         await database.transaction(() async {
@@ -715,6 +738,9 @@ class Client {
       onError.add(exception);
       await Future.delayed(Duration(seconds: syncErrorTimeoutSec), _sync);
     } catch (e, s) {
+      if (isLogged() == false || _disposed) {
+        return;
+      }
       print('Error during processing events: ' + e.toString());
       print(s);
       onSyncError.add(SyncError(
@@ -724,31 +750,26 @@ class Client {
   }
 
   /// Use this method only for testing utilities!
-  Future<void> handleSync(SyncUpdate sync) async {
+  Future<void> handleSync(SyncUpdate sync, {bool sortAtTheEnd = false}) async {
     if (sync.toDevice != null) {
       await _handleToDeviceEvents(sync.toDevice);
     }
     if (sync.rooms != null) {
       if (sync.rooms.join != null) {
-        await _handleRooms(sync.rooms.join, Membership.join);
+        await _handleRooms(sync.rooms.join, Membership.join,
+            sortAtTheEnd: sortAtTheEnd);
       }
       if (sync.rooms.invite != null) {
-        await _handleRooms(sync.rooms.invite, Membership.invite);
+        await _handleRooms(sync.rooms.invite, Membership.invite,
+            sortAtTheEnd: sortAtTheEnd);
       }
       if (sync.rooms.leave != null) {
-        await _handleRooms(sync.rooms.leave, Membership.leave);
+        await _handleRooms(sync.rooms.leave, Membership.leave,
+            sortAtTheEnd: sortAtTheEnd);
       }
     }
     if (sync.presence != null) {
       for (final newPresence in sync.presence) {
-        if (database != null) {
-          await database.storeUserEventUpdate(
-            id,
-            'presence',
-            newPresence.type,
-            newPresence.toJson(),
-          );
-        }
         presences[newPresence.senderId] = newPresence;
         onPresence.add(newPresence);
       }
@@ -756,11 +777,10 @@ class Client {
     if (sync.accountData != null) {
       for (final newAccountData in sync.accountData) {
         if (database != null) {
-          await database.storeUserEventUpdate(
+          await database.storeAccountData(
             id,
-            'account_data',
             newAccountData.type,
-            newAccountData.toJson(),
+            jsonEncode(newAccountData.content),
           );
         }
         accountData[newAccountData.type] = newAccountData;
@@ -823,7 +843,8 @@ class Client {
   }
 
   Future<void> _handleRooms(
-      Map<String, SyncRoomUpdate> rooms, Membership membership) async {
+      Map<String, SyncRoomUpdate> rooms, Membership membership,
+      {bool sortAtTheEnd = false}) async {
     for (final entry in rooms.entries) {
       final id = entry.key;
       final room = entry.value;
@@ -849,8 +870,11 @@ class Client {
           handledEvents = true;
         }
         if (room.timeline?.events?.isNotEmpty ?? false) {
-          await _handleRoomEvents(id,
-              room.timeline.events.map((i) => i.toJson()).toList(), 'timeline');
+          await _handleRoomEvents(
+              id,
+              room.timeline.events.map((i) => i.toJson()).toList(),
+              sortAtTheEnd ? 'history' : 'timeline',
+              sortAtTheEnd: sortAtTheEnd);
           handledEvents = true;
         }
         if (room.ephemeral?.isNotEmpty ?? false) {
@@ -934,14 +958,16 @@ class Client {
   }
 
   Future<void> _handleRoomEvents(
-      String chat_id, List<dynamic> events, String type) async {
+      String chat_id, List<dynamic> events, String type,
+      {bool sortAtTheEnd = false}) async {
     for (num i = 0; i < events.length; i++) {
-      await _handleEvent(events[i], chat_id, type);
+      await _handleEvent(events[i], chat_id, type, sortAtTheEnd: sortAtTheEnd);
     }
   }
 
   Future<void> _handleEvent(
-      Map<String, dynamic> event, String roomID, String type) async {
+      Map<String, dynamic> event, String roomID, String type,
+      {bool sortAtTheEnd = false}) async {
     if (event['type'] is String && event['content'] is Map<String, dynamic>) {
       // The client must ignore any new m.room.encryption event to prevent
       // man-in-the-middle attacks!
@@ -956,7 +982,9 @@ class Client {
 
       // ephemeral events aren't persisted and don't need a sort order - they are
       // expected to be processed as soon as they come in
-      final sortOrder = type != 'ephemeral' ? room.newSortOrder : 0.0;
+      final sortOrder = type != 'ephemeral'
+          ? (sortAtTheEnd ? room.oldSortOrder : room.newSortOrder)
+          : 0.0;
       var update = EventUpdate(
         eventType: event['type'],
         roomID: roomID,
@@ -967,10 +995,23 @@ class Client {
       if (event['type'] == EventTypes.Encrypted && encryptionEnabled) {
         update = await update.decrypt(room);
       }
+      if (event['type'] == EventTypes.Message &&
+          !room.isDirectChat &&
+          database != null &&
+          room.getState(EventTypes.RoomMember, event['sender']) == null) {
+        // In order to correctly render room list previews we need to fetch the member from the database
+        final user = await database.getUser(id, event['sender'], room);
+        if (user != null) {
+          room.setState(user);
+        }
+      }
       if (type != 'ephemeral' && database != null) {
         await database.storeEventUpdate(id, update);
       }
       _updateRoomsByEventUpdate(update);
+      if (encryptionEnabled) {
+        await encryption.handleEventUpdate(update);
+      }
       onEvent.add(update);
 
       if (event['type'] == 'm.call.invite') {
@@ -1086,16 +1127,23 @@ class Client {
           BasicRoomEvent.fromJson(eventUpdate.content);
     }
     if (rooms[j].onUpdate != null) rooms[j].onUpdate.add(rooms[j].id);
-    if (eventUpdate.type == 'timeline') _sortRooms();
+    if (['timeline', 'account_data'].contains(eventUpdate.type)) _sortRooms();
   }
 
   bool _sortLock = false;
 
+  /// If [true] then unread rooms are pinned at the top of the room list.
+  bool pinUnreadRooms;
+
   /// The compare function how the rooms should be sorted internally. By default
   /// rooms are sorted by timestamp of the last m.room.message event or the last
   /// event if there is no known message.
-  RoomSorter sortRoomsBy = (a, b) => b.timeCreated.millisecondsSinceEpoch
-      .compareTo(a.timeCreated.millisecondsSinceEpoch);
+  RoomSorter get sortRoomsBy => (a, b) => (a.isFavourite != b.isFavourite)
+      ? (a.isFavourite ? -1 : 1)
+      : (pinUnreadRooms && a.notificationCount != b.notificationCount)
+          ? b.notificationCount.compareTo(a.notificationCount)
+          : b.timeCreated.millisecondsSinceEpoch
+              .compareTo(a.timeCreated.millisecondsSinceEpoch);
 
   void _sortRooms() {
     if (prevBatch == null || _sortLock || rooms.length < 2) return;
@@ -1138,7 +1186,7 @@ class Client {
       var outdatedLists = <String, dynamic>{};
       for (var userId in trackedUserIds) {
         if (!userDeviceKeys.containsKey(userId)) {
-          _userDeviceKeys[userId] = DeviceKeysList(userId);
+          _userDeviceKeys[userId] = DeviceKeysList(userId, this);
         }
         var deviceKeysList = userDeviceKeys[userId];
         if (deviceKeysList.outdated) {
@@ -1154,7 +1202,7 @@ class Client {
         for (final rawDeviceKeyListEntry in response.deviceKeys.entries) {
           final userId = rawDeviceKeyListEntry.key;
           if (!userDeviceKeys.containsKey(userId)) {
-            _userDeviceKeys[userId] = DeviceKeysList(userId);
+            _userDeviceKeys[userId] = DeviceKeysList(userId, this);
           }
           final oldKeys =
               Map<String, DeviceKeys>.from(_userDeviceKeys[userId].deviceKeys);
@@ -1163,34 +1211,45 @@ class Client {
             final deviceId = rawDeviceKeyEntry.key;
 
             // Set the new device key for this device
-
-            if (!oldKeys.containsKey(deviceId)) {
-              final entry =
-                  DeviceKeys.fromMatrixDeviceKeys(rawDeviceKeyEntry.value);
-              if (entry.isValid) {
+            final entry =
+                DeviceKeys.fromMatrixDeviceKeys(rawDeviceKeyEntry.value, this);
+            if (entry.isValid) {
+              // is this a new key or the same one as an old one?
+              // better store an update - the signatures might have changed!
+              if (!oldKeys.containsKey(deviceId) ||
+                  oldKeys[deviceId].ed25519Key == entry.ed25519Key) {
+                if (oldKeys.containsKey(deviceId)) {
+                  // be sure to save the verified status
+                  entry.setDirectVerified(oldKeys[deviceId].directVerified);
+                  entry.blocked = oldKeys[deviceId].blocked;
+                  entry.validSignatures = oldKeys[deviceId].validSignatures;
+                }
                 _userDeviceKeys[userId].deviceKeys[deviceId] = entry;
                 if (deviceId == deviceID &&
-                    entry.ed25519Key == encryption?.fingerprintKey) {
+                    entry.ed25519Key == fingerprintKey) {
                   // Always trust the own device
-                  entry.verified = true;
+                  entry.setDirectVerified(true);
                 }
+              } else {
+                // This shouldn't ever happen. The same device ID has gotten
+                // a new public key. So we ignore the update. TODO: ask krille
+                // if we should instead use the new key with unknown verified / blocked status
+                _userDeviceKeys[userId].deviceKeys[deviceId] =
+                    oldKeys[deviceId];
               }
-              if (database != null) {
-                dbActions.add(() => database.storeUserDeviceKey(
-                      id,
-                      userId,
-                      deviceId,
-                      json.encode(_userDeviceKeys[userId]
-                          .deviceKeys[deviceId]
-                          .toJson()),
-                      _userDeviceKeys[userId].deviceKeys[deviceId].verified,
-                      _userDeviceKeys[userId].deviceKeys[deviceId].blocked,
-                    ));
-              }
-            } else {
-              _userDeviceKeys[userId].deviceKeys[deviceId] = oldKeys[deviceId];
+            }
+            if (database != null) {
+              dbActions.add(() => database.storeUserDeviceKey(
+                    id,
+                    userId,
+                    deviceId,
+                    json.encode(entry.toJson()),
+                    entry.directVerified,
+                    entry.blocked,
+                  ));
             }
           }
+          // delete old/unused entries
           if (database != null) {
             for (final oldDeviceKeyEntry in oldKeys.entries) {
               final deviceId = oldDeviceKeyEntry.key;
@@ -1205,6 +1264,71 @@ class Client {
           if (database != null) {
             dbActions
                 .add(() => database.storeUserDeviceKeysInfo(id, userId, false));
+          }
+        }
+        // next we parse and persist the cross signing keys
+        final crossSigningTypes = {
+          'master': response.masterKeys,
+          'self_signing': response.selfSigningKeys,
+          'user_signing': response.userSigningKeys,
+        };
+        for (final crossSigningKeysEntry in crossSigningTypes.entries) {
+          final keyType = crossSigningKeysEntry.key;
+          final keys = crossSigningKeysEntry.value;
+          if (keys == null) {
+            continue;
+          }
+          for (final crossSigningKeyListEntry in keys.entries) {
+            final userId = crossSigningKeyListEntry.key;
+            if (!userDeviceKeys.containsKey(userId)) {
+              _userDeviceKeys[userId] = DeviceKeysList(userId, this);
+            }
+            final oldKeys = Map<String, CrossSigningKey>.from(
+                _userDeviceKeys[userId].crossSigningKeys);
+            _userDeviceKeys[userId].crossSigningKeys = {};
+            // add the types we aren't handling atm back
+            for (final oldEntry in oldKeys.entries) {
+              if (!oldEntry.value.usage.contains(keyType)) {
+                _userDeviceKeys[userId].crossSigningKeys[oldEntry.key] =
+                    oldEntry.value;
+              }
+            }
+            final entry = CrossSigningKey.fromMatrixCrossSigningKey(
+                crossSigningKeyListEntry.value, this);
+            if (entry.isValid) {
+              final publicKey = entry.publicKey;
+              if (!oldKeys.containsKey(publicKey) ||
+                  oldKeys[publicKey].ed25519Key == entry.ed25519Key) {
+                if (oldKeys.containsKey(publicKey)) {
+                  // be sure to save the verification status
+                  entry.setDirectVerified(oldKeys[publicKey].directVerified);
+                  entry.blocked = oldKeys[publicKey].blocked;
+                  entry.validSignatures = oldKeys[publicKey].validSignatures;
+                }
+                _userDeviceKeys[userId].crossSigningKeys[publicKey] = entry;
+              } else {
+                // This shouldn't ever happen. The same device ID has gotten
+                // a new public key. So we ignore the update. TODO: ask krille
+                // if we should instead use the new key with unknown verified / blocked status
+                _userDeviceKeys[userId].crossSigningKeys[publicKey] =
+                    oldKeys[publicKey];
+              }
+              if (database != null) {
+                dbActions.add(() => database.storeUserCrossSigningKey(
+                      id,
+                      userId,
+                      publicKey,
+                      json.encode(entry.toJson()),
+                      entry.directVerified,
+                      entry.blocked,
+                    ));
+              }
+            }
+            _userDeviceKeys[userId].outdated = false;
+            if (database != null) {
+              dbActions.add(
+                  () => database.storeUserDeviceKeysInfo(id, userId, false));
+            }
           }
         }
       }
@@ -1226,12 +1350,16 @@ class Client {
     Map<String, dynamic> message, {
     bool encrypted = true,
     List<User> toUsers,
+    bool onlyVerified = false,
   }) async {
     if (encrypted && !encryptionEnabled) return;
-    // Don't send this message to blocked devices.
+    // Don't send this message to blocked devices, and if specified onlyVerified
+    // then only send it to verified devices
     if (deviceKeys.isNotEmpty) {
       deviceKeys.removeWhere((DeviceKeys deviceKeys) =>
-          deviceKeys.blocked || deviceKeys.deviceId == deviceID);
+          deviceKeys.blocked ||
+          deviceKeys.deviceId == deviceID ||
+          (onlyVerified && !deviceKeys.verified));
       if (deviceKeys.isEmpty) return;
     }
 

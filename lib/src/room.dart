@@ -25,9 +25,7 @@ import 'package:famedlysdk/src/event.dart';
 import 'package:famedlysdk/src/utils/event_update.dart';
 import 'package:famedlysdk/src/utils/room_update.dart';
 import 'package:famedlysdk/src/utils/matrix_file.dart';
-import 'package:image/image.dart';
 import 'package:matrix_file_e2ee/matrix_file_e2ee.dart';
-import 'package:mime_type/mime_type.dart';
 import 'package:html_unescape/html_unescape.dart';
 
 import './user.dart';
@@ -81,7 +79,11 @@ class Room {
   double _oldestSortOrder;
 
   double get newSortOrder {
-    _newestSortOrder++;
+    var now = DateTime.now().millisecondsSinceEpoch.toDouble();
+    if (_newestSortOrder >= now) {
+      now = _newestSortOrder + 1;
+    }
+    _newestSortOrder = now;
     return _newestSortOrder;
   }
 
@@ -97,6 +99,25 @@ class Room {
   Future<void> updateSortOrder() async {
     await client.database?.updateRoomSortOrder(
         _oldestSortOrder, _newestSortOrder, client.id, id);
+  }
+
+  /// Flag if the room is partial, meaning not all state events have been loaded yet
+  bool partial = true;
+
+  /// Load all the missing state events for the room from the database. If the room has already been loaded, this does nothing.
+  Future<void> postLoad() async {
+    if (!partial || client.database == null) {
+      return;
+    }
+    final allStates = await client.database
+        .getUnimportantRoomStatesForRoom(
+            client.id, id, client.importantStateEvents.toList())
+        .get();
+    for (final state in allStates) {
+      final newState = Event.fromDb(state, this);
+      setState(newState);
+    }
+    partial = false;
   }
 
   /// Returns the [Event] for the given [typeKey] and optional [stateKey].
@@ -151,6 +172,14 @@ class Room {
   String get name => states[EventTypes.RoomName] != null
       ? states[EventTypes.RoomName].content['name']
       : '';
+
+  /// The pinned events for this room. If there are no this returns an empty
+  /// list.
+  List<String> get pinnedEventIds => states[EventTypes.RoomPinnedEvents] != null
+      ? (states[EventTypes.RoomPinnedEvents].content['pinned'] is List<String>
+          ? states[EventTypes.RoomPinnedEvents].content['pinned']
+          : <String>[])
+      : <String>[];
 
   /// Returns a localized displayname for this server. If the room is a groupchat
   /// without a name, then it will return the localized version of 'Group with Alice' instead
@@ -353,6 +382,48 @@ class Room {
         {'topic': newName},
       );
 
+  /// Add a tag to the room.
+  Future<void> addTag(String tag, {double order}) => client.api.addRoomTag(
+        client.userID,
+        id,
+        tag,
+        order: order,
+      );
+
+  /// Removes a tag from the room.
+  Future<void> removeTag(String tag) => client.api.removeRoomTag(
+        client.userID,
+        id,
+        tag,
+      );
+
+  /// Returns all tags for this room.
+  Map<String, Tag> get tags {
+    if (roomAccountData['m.tag'] == null ||
+        !(roomAccountData['m.tag'].content['tags'] is Map)) {
+      return {};
+    }
+    final tags = (roomAccountData['m.tag'].content['tags'] as Map)
+        .map((k, v) => MapEntry<String, Tag>(k, Tag.fromJson(v)));
+    tags.removeWhere((k, v) => !TagType.isValid(k));
+    return tags;
+  }
+
+  /// Returns true if this room has a m.favourite tag.
+  bool get isFavourite => tags[TagType.Favourite] != null;
+
+  /// Sets the m.favourite tag for this room.
+  Future<void> setFavourite(bool favourite) =>
+      favourite ? addTag(TagType.Favourite) : removeTag(TagType.Favourite);
+
+  /// Call the Matrix API to change the pinned events of this room.
+  Future<String> setPinnedEvents(List<String> pinnedEventIds) =>
+      client.api.sendState(
+        id,
+        EventTypes.RoomPinnedEvents,
+        {'pinned': pinnedEventIds},
+      );
+
   /// return all current emote packs for this room
   Map<String, Map<String, String>> get emotePacks {
     final packs = <String, Map<String, String>>{};
@@ -411,7 +482,9 @@ class Room {
             final event = room.getState('im.ponies.room_emotes', stateKey);
             if (event != null && stateKeyEntry.value is Map) {
               addEmotePack(
-                  room.canonicalAlias.isEmpty ? room.id : canonicalAlias,
+                  (room.canonicalAlias?.isEmpty ?? true)
+                      ? room.id
+                      : canonicalAlias,
                   event.content,
                   stateKeyEntry.value['name']);
             }
@@ -448,79 +521,53 @@ class Room {
     return sendEvent(event, txid: txid, inReplyTo: inReplyTo);
   }
 
-  /// Sends a [file] to this room after uploading it. The [msgType] is optional
-  /// and will be detected by the mimetype of the file. Returns the mxc uri of
+  /// Sends a [file] to this room after uploading it. Returns the mxc uri of
   /// the uploaded file. If [waitUntilSent] is true, the future will wait until
   /// the message event has received the server. Otherwise the future will only
   /// wait until the file has been uploaded.
   Future<String> sendFileEvent(
     MatrixFile file, {
-    String msgType,
     String txid,
     Event inReplyTo,
-    Map<String, dynamic> info,
     bool waitUntilSent = false,
-    MatrixFile thumbnail,
+    MatrixImageFile thumbnail,
   }) async {
-    Image fileImage;
-    Image thumbnailImage;
-    EncryptedFile encryptedThumbnail;
-    String thumbnailUploadResp;
-
-    var fileName = file.path.split('/').last;
-    final mimeType = mime(file.path) ?? '';
-    if (msgType == null) {
-      final metaType = (mimeType).split('/')[0];
-      switch (metaType) {
-        case 'image':
-        case 'audio':
-        case 'video':
-          msgType = 'm.$metaType';
-          break;
-        default:
-          msgType = 'm.file';
-          break;
-      }
-    }
-
-    if (msgType == 'm.image') {
-      fileImage = decodeImage(file.bytes.toList());
-      if (thumbnail != null) {
-        thumbnailImage = decodeImage(thumbnail.bytes.toList());
-      }
-    }
-
-    final sendEncrypted = encrypted && client.fileEncryptionEnabled;
+    MatrixFile uploadFile = file; // ignore: omit_local_variable_types
+    MatrixFile uploadThumbnail = thumbnail; // ignore: omit_local_variable_types
     EncryptedFile encryptedFile;
-    if (sendEncrypted) {
+    EncryptedFile encryptedThumbnail;
+    if (encrypted && client.fileEncryptionEnabled) {
       encryptedFile = await file.encrypt();
+      uploadFile = encryptedFile.toMatrixFile();
+
       if (thumbnail != null) {
         encryptedThumbnail = await thumbnail.encrypt();
+        uploadThumbnail = encryptedThumbnail.toMatrixFile();
       }
     }
     final uploadResp = await client.api.upload(
-      file.bytes,
-      file.path,
-      contentType: sendEncrypted ? 'application/octet-stream' : null,
+      uploadFile.bytes,
+      uploadFile.name,
+      contentType: uploadFile.mimeType,
     );
-    if (thumbnail != null) {
-      thumbnailUploadResp = await client.api.upload(
-        thumbnail.bytes,
-        thumbnail.path,
-        contentType: sendEncrypted ? 'application/octet-stream' : null,
-      );
-    }
+    final thumbnailUploadResp = uploadThumbnail != null
+        ? await client.api.upload(
+            uploadThumbnail.bytes,
+            uploadThumbnail.name,
+            contentType: uploadThumbnail.mimeType,
+          )
+        : null;
 
     // Send event
     var content = <String, dynamic>{
-      'msgtype': msgType,
-      'body': fileName,
-      'filename': fileName,
-      if (!sendEncrypted) 'url': uploadResp,
-      if (sendEncrypted)
+      'msgtype': file.msgType,
+      'body': file.name,
+      'filename': file.name,
+      if (encryptedFile == null) 'url': uploadResp,
+      if (encryptedFile != null)
         'file': {
           'url': uploadResp,
-          'mimetype': mimeType,
+          'mimetype': file.mimeType,
           'v': 'v2',
           'key': {
             'alg': 'A256CTR',
@@ -532,37 +579,27 @@ class Room {
           'iv': encryptedFile.iv,
           'hashes': {'sha256': encryptedFile.sha256}
         },
-      'info': info ??
-          {
-            'mimetype': mimeType,
-            'size': file.size,
-            if (fileImage != null) 'h': fileImage.height,
-            if (fileImage != null) 'w': fileImage.width,
-            if (thumbnailUploadResp != null && !sendEncrypted)
-              'thumbnail_url': thumbnailUploadResp,
-            if (thumbnailUploadResp != null && sendEncrypted)
-              'thumbnail_file': {
-                'url': thumbnailUploadResp,
-                'mimetype': mimeType,
-                'v': 'v2',
-                'key': {
-                  'alg': 'A256CTR',
-                  'ext': true,
-                  'k': encryptedThumbnail.k,
-                  'key_ops': ['encrypt', 'decrypt'],
-                  'kty': 'oct'
-                },
-                'iv': encryptedThumbnail.iv,
-                'hashes': {'sha256': encryptedThumbnail.sha256}
-              },
-            if (thumbnailImage != null)
-              'thumbnail_info': {
-                'h': thumbnailImage.height,
-                'mimetype': mimeType,
-                'size': thumbnail.size,
-                'w': thumbnailImage.width,
-              }
-          }
+      'info': {
+        ...file.info,
+        if (thumbnail != null && encryptedThumbnail == null)
+          'thumbnail_url': thumbnailUploadResp,
+        if (thumbnail != null && encryptedThumbnail != null)
+          'thumbnail_file': {
+            'url': thumbnailUploadResp,
+            'mimetype': thumbnail.mimeType,
+            'v': 'v2',
+            'key': {
+              'alg': 'A256CTR',
+              'ext': true,
+              'k': encryptedThumbnail.k,
+              'key_ops': ['encrypt', 'decrypt'],
+              'kty': 'oct'
+            },
+            'iv': encryptedThumbnail.iv,
+            'hashes': {'sha256': encryptedThumbnail.sha256}
+          },
+        if (thumbnail != null) 'thumbnail_info': thumbnail.info,
+      }
     };
     final sendResponse = sendEvent(
       content,
@@ -573,80 +610,6 @@ class Room {
       await sendResponse;
     }
     return uploadResp;
-  }
-
-  /// Sends an audio file to this room and returns the mxc uri.
-  Future<String> sendAudioEvent(MatrixFile file,
-      {String txid, Event inReplyTo}) async {
-    return await sendFileEvent(file,
-        msgType: 'm.audio', txid: txid, inReplyTo: inReplyTo);
-  }
-
-  /// Sends an image to this room and returns the mxc uri.
-  Future<String> sendImageEvent(MatrixFile file,
-      {String txid, int width, int height, Event inReplyTo}) async {
-    return await sendFileEvent(file,
-        msgType: 'm.image',
-        txid: txid,
-        inReplyTo: inReplyTo,
-        info: {
-          'size': file.size,
-          'mimetype': mime(file.path.split('/').last),
-          'w': width,
-          'h': height,
-        });
-  }
-
-  /// Sends an video to this room and returns the mxc uri.
-  Future<String> sendVideoEvent(MatrixFile file,
-      {String txid,
-      int videoWidth,
-      int videoHeight,
-      int duration,
-      MatrixFile thumbnail,
-      int thumbnailWidth,
-      int thumbnailHeight,
-      Event inReplyTo}) async {
-    var fileName = file.path.split('/').last;
-    var info = <String, dynamic>{
-      'size': file.size,
-      'mimetype': mime(fileName),
-    };
-    if (videoWidth != null) {
-      info['w'] = videoWidth;
-    }
-    if (thumbnailHeight != null) {
-      info['h'] = thumbnailHeight;
-    }
-    if (duration != null) {
-      info['duration'] = duration;
-    }
-    if (thumbnail != null && !(encrypted && client.encryptionEnabled)) {
-      var thumbnailName = file.path.split('/').last;
-      final thumbnailUploadResp = await client.api.upload(
-        thumbnail.bytes,
-        thumbnail.path,
-      );
-      info['thumbnail_url'] = thumbnailUploadResp;
-      info['thumbnail_info'] = {
-        'size': thumbnail.size,
-        'mimetype': mime(thumbnailName),
-      };
-      if (thumbnailWidth != null) {
-        info['thumbnail_info']['w'] = thumbnailWidth;
-      }
-      if (thumbnailHeight != null) {
-        info['thumbnail_info']['h'] = thumbnailHeight;
-      }
-    }
-
-    return await sendFileEvent(
-      file,
-      msgType: 'm.video',
-      txid: txid,
-      inReplyTo: inReplyTo,
-      info: info,
-    );
   }
 
   /// Sends an event to this room with this json as a content. Returns the
@@ -828,28 +791,17 @@ class Room {
     final loadFn = () async {
       if (!((resp.chunk?.isNotEmpty ?? false) && resp.end != null)) return;
 
-      if (resp.state != null) {
-        for (final state in resp.state) {
-          await EventUpdate(
-            type: 'state',
-            roomID: id,
-            eventType: state.type,
-            content: state.toJson(),
-            sortOrder: oldSortOrder,
-          ).decrypt(this, store: true);
-        }
-      }
-
-      for (final hist in resp.chunk) {
-        final eventUpdate = await EventUpdate(
-          type: 'history',
-          roomID: id,
-          eventType: hist.type,
-          content: hist.toJson(),
-          sortOrder: oldSortOrder,
-        ).decrypt(this, store: true);
-        client.onEvent.add(eventUpdate);
-      }
+      await client.handleSync(
+          SyncUpdate()
+            ..rooms = (RoomsUpdate()
+              ..join = {
+                '$id': (JoinedRoomUpdate()
+                  ..state = resp.state
+                  ..timeline = (TimelineUpdate()
+                    ..events = resp.chunk
+                    ..prevBatch = resp.end)),
+              }),
+          sortAtTheEnd: true);
     };
 
     if (client.database != null) {
@@ -861,21 +813,12 @@ class Room {
     } else {
       await loadFn();
     }
-    client.onRoomUpdate.add(
-      RoomUpdate(
-        id: id,
-        membership: membership,
-        prev_batch: resp.end,
-        notification_count: notificationCount,
-        highlight_count: highlightCount,
-      ),
-    );
   }
 
   /// Sets this room as a direct chat for this user if not already.
   Future<void> addToDirectChat(String userID) async {
     var directChats = client.directChats;
-    if (directChats.containsKey(userID)) {
+    if (directChats[userID] is List) {
       if (!directChats[userID].contains(id)) {
         directChats[userID].add(id);
       } else {
@@ -885,9 +828,8 @@ class Room {
       directChats[userID] = [id];
     }
 
-    await client.api.setRoomAccountData(
+    await client.api.setAccountData(
       client.userID,
-      id,
       'm.direct',
       directChats,
     );
@@ -897,7 +839,7 @@ class Room {
   /// Removes this room from all direct chat tags.
   Future<void> removeFromDirectChat() async {
     var directChats = client.directChats;
-    if (directChats.containsKey(directChatMatrixID) &&
+    if (directChats[directChatMatrixID] is List &&
         directChats[directChatMatrixID].contains(id)) {
       directChats[directChatMatrixID].remove(id);
     } else {
@@ -991,6 +933,7 @@ class Room {
   Future<Timeline> getTimeline(
       {onTimelineUpdateCallback onUpdate,
       onTimelineInsertCallback onInsert}) async {
+    await postLoad();
     var events;
     if (client.database != null) {
       events = await client.database.getEventList(client.id, this);
@@ -1041,10 +984,20 @@ class Room {
   /// Request the full list of participants from the server. The local list
   /// from the store is not complete if the client uses lazy loading.
   Future<List<User>> requestParticipants() async {
+    if (!participantListComplete && partial && client.database != null) {
+      // we aren't fully loaded, maybe the users are in the database
+      final users = await client.database.getUsers(client.id, this);
+      for (final user in users) {
+        setState(user);
+      }
+    }
     if (participantListComplete) return getParticipants();
     final matrixEvents = await client.api.requestMembers(id);
     final users =
         matrixEvents.map((e) => Event.fromMatrixEvent(e, this).asUser).toList();
+    for (final user in users) {
+      setState(user); // at *least* cache this in-memory
+    }
     users.removeWhere(
         (u) => [Membership.leave, Membership.ban].contains(u.membership));
     return users;
@@ -1080,10 +1033,24 @@ class Room {
   final Set<String> _requestingMatrixIds = {};
 
   /// Requests a missing [User] for this room. Important for clients using
-  /// lazy loading.
-  Future<User> requestUser(String mxID, {bool ignoreErrors = false}) async {
+  /// lazy loading. If the user can't be found this method tries to fetch
+  /// the displayname and avatar from the profile if [requestProfile] is true.
+  Future<User> requestUser(
+    String mxID, {
+    bool ignoreErrors = false,
+    bool requestProfile = true,
+  }) async {
     if (getState(EventTypes.RoomMember, mxID) != null) {
       return getState(EventTypes.RoomMember, mxID).asUser;
+    }
+    if (client.database != null) {
+      // it may be in the database
+      final user = await client.database.getUser(client.id, mxID, this);
+      if (user != null) {
+        setState(user);
+        if (onUpdate != null) onUpdate.add(id);
+        return user;
+      }
     }
     if (mxID == null || !_requestingMatrixIds.add(mxID)) return null;
     Map<String, dynamic> resp;
@@ -1094,8 +1061,22 @@ class Room {
         mxID,
       );
     } catch (exception) {
-      _requestingMatrixIds.remove(mxID);
-      if (!ignoreErrors) rethrow;
+      if (!ignoreErrors) {
+        _requestingMatrixIds.remove(mxID);
+        rethrow;
+      }
+    }
+    if (resp == null && requestProfile) {
+      try {
+        final profile = await client.api.requestProfile(mxID);
+        resp = {
+          'displayname': profile.displayname,
+          'avatar_url': profile.avatarUrl,
+        };
+      } catch (exception) {
+        _requestingMatrixIds.remove(mxID);
+        if (!ignoreErrors) rethrow;
+      }
     }
     if (resp == null) {
       return null;
@@ -1163,7 +1144,7 @@ class Room {
   /// Uploads a new user avatar for this room. Returns the event ID of the new
   /// m.room.avatar event.
   Future<String> setAvatar(MatrixFile file) async {
-    final uploadResp = await client.api.upload(file.bytes, file.path);
+    final uploadResp = await client.api.upload(file.bytes, file.name);
     return await client.api.sendState(
       id,
       EventTypes.RoomAvatar,

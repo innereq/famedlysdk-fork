@@ -60,7 +60,7 @@ class Event extends MatrixEvent {
 
   /// Optional. The event that redacted this event, if any. Otherwise null.
   Event get redactedBecause =>
-      unsigned != null && unsigned.containsKey('redacted_because')
+      unsigned != null && unsigned['redacted_because'] is Map
           ? Event.fromJson(unsigned['redacted_because'], room)
           : null;
 
@@ -89,7 +89,13 @@ class Event extends MatrixEvent {
     this.roomId = roomId ?? room?.id;
     this.senderId = senderId;
     this.unsigned = unsigned;
-    this.prevContent = prevContent;
+    // synapse unfortunatley isn't following the spec and tosses the prev_content
+    // into the unsigned block
+    this.prevContent = prevContent != null && prevContent.isNotEmpty
+        ? prevContent
+        : (unsigned != null && unsigned['prev_content'] is Map
+            ? unsigned['prev_content']
+            : null);
     this.stateKey = stateKey;
     this.originServerTs = originServerTs;
   }
@@ -206,7 +212,7 @@ class Event extends MatrixEvent {
       unsigned: unsigned,
       room: room);
 
-  String get messageType => (content.containsKey('m.relates_to') &&
+  String get messageType => (content['m.relates_to'] is Map &&
           content['m.relates_to']['m.in_reply_to'] != null)
       ? MessageTypes.Reply
       : content['msgtype'] ?? MessageTypes.Text;
@@ -307,7 +313,10 @@ class Event extends MatrixEvent {
   Future<String> sendAgain({String txid}) async {
     if (status != -1) return null;
     await remove();
-    final eventID = await room.sendTextEvent(text, txid: txid);
+    final eventID = await room.sendEvent(
+      content,
+      txid: txid ?? unsigned['transaction_id'],
+    );
     return eventID;
   }
 
@@ -350,8 +359,8 @@ class Event extends MatrixEvent {
 
   bool get hasThumbnail =>
       content['info'] is Map<String, dynamic> &&
-      (content['info'].containsKey('thumbnail_url') ||
-          content['info'].containsKey('thumbnail_file'));
+      (content['info']['thumbnail_url'] is String ||
+          content['info']['thumbnail_file'] is Map);
 
   /// Downloads (and decryptes if necessary) the attachment of this
   /// event and returns it as a [MatrixFile]. If this event doesn't
@@ -363,16 +372,16 @@ class Event extends MatrixEvent {
       throw ("This event has the type '$type' and so it can't contain an attachment.");
     }
     if (!getThumbnail &&
-        !content.containsKey('url') &&
-        !content.containsKey('file')) {
+        !(content['url'] is String) &&
+        !(content['file'] is Map)) {
       throw ("This event hasn't any attachment.");
     }
     if (getThumbnail && !hasThumbnail) {
       throw ("This event hasn't any thumbnail.");
     }
     final isEncrypted = getThumbnail
-        ? !content['info'].containsKey('thumbnail_url')
-        : !content.containsKey('url');
+        ? !(content['info']['thumbnail_url'] is String)
+        : !(content['url'] is String);
 
     if (isEncrypted && !room.client.encryptionEnabled) {
       throw ('Encryption is not enabled in your Client.');
@@ -421,7 +430,7 @@ class Event extends MatrixEvent {
       encryptedFile.sha256 = fileMap['hashes']['sha256'];
       uint8list = await decryptFile(encryptedFile);
     }
-    return MatrixFile(bytes: uint8list, path: '/$body');
+    return MatrixFile(bytes: uint8list, name: body);
   }
 
   /// Returns a localized String representation of this event. For a

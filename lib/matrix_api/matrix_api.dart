@@ -18,13 +18,14 @@
 
 import 'dart:async';
 import 'dart:convert';
+
 import 'package:famedlysdk/matrix_api/model/filter.dart';
 import 'package:famedlysdk/matrix_api/model/keys_query_response.dart';
 import 'package:famedlysdk/matrix_api/model/login_types.dart';
 import 'package:famedlysdk/matrix_api/model/notifications_query_response.dart';
 import 'package:famedlysdk/matrix_api/model/open_graph_data.dart';
-import 'package:famedlysdk/matrix_api/model/request_token_response.dart';
 import 'package:famedlysdk/matrix_api/model/profile.dart';
+import 'package:famedlysdk/matrix_api/model/request_token_response.dart';
 import 'package:famedlysdk/matrix_api/model/server_capabilities.dart';
 import 'package:famedlysdk/matrix_api/model/supported_versions.dart';
 import 'package:famedlysdk/matrix_api/model/sync_update.dart';
@@ -32,16 +33,16 @@ import 'package:famedlysdk/matrix_api/model/third_party_location.dart';
 import 'package:famedlysdk/matrix_api/model/timeline_history_response.dart';
 import 'package:famedlysdk/matrix_api/model/user_search_result.dart';
 import 'package:http/http.dart' as http;
-import 'package:mime_type/mime_type.dart';
+import 'package:mime/mime.dart';
 import 'package:moor/moor.dart';
 
 import 'model/device.dart';
-import 'model/matrix_device_keys.dart';
-import 'model/matrix_event.dart';
 import 'model/event_context.dart';
 import 'model/events_sync_update.dart';
 import 'model/login_response.dart';
+import 'model/matrix_event.dart';
 import 'model/matrix_exception.dart';
+import 'model/matrix_keys.dart';
 import 'model/one_time_keys_claim_response.dart';
 import 'model/open_id_credentials.dart';
 import 'model/presence_content.dart';
@@ -49,11 +50,14 @@ import 'model/public_rooms_response.dart';
 import 'model/push_rule_set.dart';
 import 'model/pusher.dart';
 import 'model/room_alias_informations.dart';
+import 'model/room_keys_info.dart';
+import 'model/room_keys_keys.dart';
 import 'model/supported_protocol.dart';
 import 'model/tag.dart';
 import 'model/third_party_identifier.dart';
 import 'model/third_party_user.dart';
 import 'model/turn_server_credentials.dart';
+import 'model/upload_key_signatures_response.dart';
 import 'model/well_known_informations.dart';
 import 'model/who_is_info.dart';
 
@@ -64,6 +68,13 @@ enum Membership { join, invite, leave, ban }
 enum Direction { b, f }
 enum Visibility { public, private }
 enum CreateRoomPreset { private_chat, public_chat, trusted_private_chat }
+
+String describeEnum(Object enumEntry) {
+  final description = enumEntry.toString();
+  final indexOfDot = description.indexOf('.');
+  assert(indexOfDot != -1 && indexOfDot < description.length - 1);
+  return description.substring(indexOfDot + 1);
+}
 
 class MatrixApi {
   /// The homeserver this client is communicating with.
@@ -117,10 +128,14 @@ class MatrixApi {
   ///  );
   /// ```
   ///
-  Future<Map<String, dynamic>> request(RequestType type, String action,
-      {dynamic data = '',
-      int timeout,
-      String contentType = 'application/json'}) async {
+  Future<Map<String, dynamic>> request(
+    RequestType type,
+    String action, {
+    dynamic data = '',
+    int timeout,
+    String contentType = 'application/json',
+    Map<String, String> query,
+  }) async {
     if (homeserver == null) {
       throw ('No homeserver specified.');
     }
@@ -130,7 +145,13 @@ class MatrixApi {
     (!(data is String)) ? json = jsonEncode(data) : json = data;
     if (data is List<int> || action.startsWith('/media/r0/upload')) json = data;
 
-    final url = '${homeserver.toString()}/_matrix${action}';
+    final queryPart = query?.entries
+        ?.where((x) => x.value != null)
+        ?.map((x) => [x.key, x.value].map(Uri.encodeQueryComponent).join('='))
+        ?.join('&');
+    final url = ['${homeserver.toString()}/_matrix${action}', queryPart]
+        .where((x) => x != null && x != '')
+        .join('?');
 
     var headers = <String, String>{};
     if (type == RequestType.PUT || type == RequestType.POST) {
@@ -142,13 +163,13 @@ class MatrixApi {
 
     if (debug) {
       print(
-          "[REQUEST ${type.toString().split('.').last}] $action, Data: ${jsonEncode(data)}");
+          '[REQUEST ${describeEnum(type)}] $action, Data: ${jsonEncode(data)}');
     }
 
     http.Response resp;
     var jsonResp = <String, dynamic>{};
     try {
-      switch (type.toString().split('.').last) {
+      switch (describeEnum(type)) {
         case 'GET':
           resp = await httpClient.get(url, headers: headers).timeout(
                 Duration(seconds: timeout),
@@ -172,7 +193,13 @@ class MatrixApi {
               );
           break;
       }
-      var jsonString = String.fromCharCodes(resp.body.runes);
+      var respBody = resp.body;
+      try {
+        respBody = utf8.decode(resp.bodyBytes);
+      } catch (_) {
+        // No-OP
+      }
+      var jsonString = String.fromCharCodes(respBody.runes);
       if (jsonString.startsWith('[') && jsonString.endsWith(']')) {
         jsonString = '\{"chunk":$jsonString\}';
       }
@@ -211,8 +238,11 @@ class MatrixApi {
   /// Gets discovery information about the domain. The file may include additional keys.
   /// https://matrix.org/docs/spec/client_server/r0.6.0#get-well-known-matrix-client
   Future<WellKnownInformations> requestWellKnownInformations() async {
-    final response = await httpClient
-        .get('${homeserver.toString()}/.well-known/matrix/client');
+    var baseUrl = homeserver.toString();
+    if (baseUrl.endsWith('/')) {
+      baseUrl = baseUrl.substring(0, baseUrl.length - 1);
+    }
+    final response = await httpClient.get('$baseUrl/.well-known/matrix/client');
     final rawJson = json.decode(response.body);
     return WellKnownInformations.fromJson(rawJson);
   }
@@ -433,8 +463,7 @@ class MatrixApi {
     });
 
     return IdServerUnbindResult.values.firstWhere(
-      (i) =>
-          i.toString().split('.').last == response['id_server_unbind_result'],
+      (i) => describeEnum(i) == response['id_server_unbind_result'],
     );
   }
 
@@ -504,12 +533,11 @@ class MatrixApi {
         RequestType.POST, '/client/r0/account/3pid/delete',
         data: {
           'address': address,
-          'medium': medium.toString().split('.').last,
+          'medium': describeEnum(medium),
           'id_server': idServer,
         });
     return IdServerUnbindResult.values.firstWhere(
-      (i) =>
-          i.toString().split('.').last == response['id_server_unbind_result'],
+      (i) => describeEnum(i) == response['id_server_unbind_result'],
     );
   }
 
@@ -524,12 +552,11 @@ class MatrixApi {
         RequestType.POST, '/client/r0/account/3pid/unbind',
         data: {
           'address': address,
-          'medium': medium.toString().split('.').last,
+          'medium': describeEnum(medium),
           'id_server': idServer,
         });
     return IdServerUnbindResult.values.firstWhere(
-      (i) =>
-          i.toString().split('.').last == response['id_server_unbind_result'],
+      (i) => describeEnum(i) == response['id_server_unbind_result'],
     );
   }
 
@@ -637,37 +664,16 @@ class MatrixApi {
     PresenceType setPresence,
     int timeout,
   }) async {
-    var atLeastOneParameter = false;
-    var action = '/client/r0/sync';
-    if (filter != null) {
-      action += atLeastOneParameter ? '&' : '?';
-      action += 'filter=${Uri.encodeQueryComponent(filter)}';
-      atLeastOneParameter = true;
-    }
-    if (since != null) {
-      action += atLeastOneParameter ? '&' : '?';
-      action += 'since=${Uri.encodeQueryComponent(since)}';
-      atLeastOneParameter = true;
-    }
-    if (fullState != null) {
-      action += atLeastOneParameter ? '&' : '?';
-      action += 'full_state=${Uri.encodeQueryComponent(fullState.toString())}';
-      atLeastOneParameter = true;
-    }
-    if (setPresence != null) {
-      action += atLeastOneParameter ? '&' : '?';
-      action +=
-          'set_presence=${Uri.encodeQueryComponent(setPresence.toString().split('.').last)}';
-      atLeastOneParameter = true;
-    }
-    if (timeout != null) {
-      action += atLeastOneParameter ? '&' : '?';
-      action += 'timeout=${Uri.encodeQueryComponent(timeout.toString())}';
-      atLeastOneParameter = true;
-    }
     final response = await request(
       RequestType.GET,
-      action,
+      '/client/r0/sync',
+      query: {
+        if (filter != null) 'filter': filter,
+        if (since != null) 'since': since,
+        if (fullState != null) 'full_state': fullState.toString(),
+        if (setPresence != null) 'set_presence': describeEnum(setPresence),
+        if (timeout != null) 'timeout': timeout.toString(),
+      },
     );
     return SyncUpdate.fromJson(response);
   }
@@ -722,28 +728,15 @@ class MatrixApi {
     Membership membership,
     Membership notMembership,
   }) async {
-    var action = '/client/r0/rooms/${Uri.encodeComponent(roomId)}/members';
-    var atLeastOneParameter = false;
-    if (at != null) {
-      action += atLeastOneParameter ? '&' : '?';
-      action += 'at=${Uri.encodeQueryComponent(at)}';
-      atLeastOneParameter = true;
-    }
-    if (membership != null) {
-      action += atLeastOneParameter ? '&' : '?';
-      action +=
-          'membership=${Uri.encodeQueryComponent(membership.toString().split('.').last)}';
-      atLeastOneParameter = true;
-    }
-    if (notMembership != null) {
-      action += atLeastOneParameter ? '&' : '?';
-      action +=
-          'not_membership=${Uri.encodeQueryComponent(notMembership.toString().split('.').last)}';
-      atLeastOneParameter = true;
-    }
     final response = await request(
       RequestType.GET,
-      action,
+      '/client/r0/rooms/${Uri.encodeComponent(roomId)}/members',
+      query: {
+        if (at != null) 'at': at,
+        if (membership != null) 'membership': describeEnum(membership),
+        if (notMembership != null)
+          'not_membership': describeEnum(notMembership),
+      },
     );
     return (response['chunk'] as List)
         .map((i) => MatrixEvent.fromJson(i))
@@ -773,23 +766,15 @@ class MatrixApi {
     int limit,
     String filter,
   }) async {
-    var action = '/client/r0/rooms/${Uri.encodeComponent(roomId)}/messages';
-    action += '?from=${Uri.encodeQueryComponent(from)}';
-    action +=
-        '&dir=${Uri.encodeQueryComponent(dir.toString().split('.').last)}';
-    if (to != null) {
-      action += '&to=${Uri.encodeQueryComponent(to)}';
-    }
-    if (limit != null) {
-      action += '&limit=${Uri.encodeQueryComponent(limit.toString())}';
-    }
-    if (filter != null) {
-      action += '&filter=${Uri.encodeQueryComponent(filter)}';
-    }
-    final response = await request(
-      RequestType.GET,
-      action,
-    );
+    final response = await request(RequestType.GET,
+        '/client/r0/rooms/${Uri.encodeComponent(roomId)}/messages',
+        query: {
+          'from': from,
+          'dir': describeEnum(dir),
+          if (to != null) 'to': to,
+          if (limit != null) 'limit': limit.toString(),
+          if (filter != null) 'filter': filter,
+        });
     return TimelineHistoryResponse.fromJson(response);
   }
 
@@ -856,8 +841,7 @@ class MatrixApi {
   }) async {
     final response =
         await request(RequestType.POST, '/client/r0/createRoom', data: {
-      if (visibility != null)
-        'visibility': visibility.toString().split('.').last,
+      if (visibility != null) 'visibility': describeEnum(visibility),
       if (roomAliasName != null) 'room_alias_name': roomAliasName,
       if (name != null) 'name': name,
       if (topic != null) 'topic': topic,
@@ -866,7 +850,7 @@ class MatrixApi {
       if (roomVersion != null) 'room_version': roomVersion,
       if (creationContent != null) 'creation_content': creationContent,
       if (initialState != null) 'initial_state': initialState,
-      if (preset != null) 'preset': preset.toString().split('.').last,
+      if (preset != null) 'preset': describeEnum(preset),
       if (isDirect != null) 'is_direct': isDirect,
       if (powerLevelContentOverride != null)
         'power_level_content_override': powerLevelContentOverride,
@@ -975,15 +959,11 @@ class MatrixApi {
     Map<String, dynamic> thirdPidSignedSiganture,
   }) async {
     var action = '/client/r0/join/${Uri.encodeComponent(roomIdOrAlias)}';
-    if (servers != null) {
-      for (var i = 0; i < servers.length; i++) {
-        if (i == 0) {
-          action += '?';
-        } else {
-          action += '&';
-        }
-        action += 'server_name=${Uri.encodeQueryComponent(servers[i])}';
-      }
+    final queryPart = servers
+        ?.map((x) => 'server_name=${Uri.encodeQueryComponent(x)}')
+        ?.join('&');
+    if (queryPart != null && queryPart != '') {
+      action += '?' + queryPart;
     }
     final response = await request(
       RequestType.POST,
@@ -1067,8 +1047,8 @@ class MatrixApi {
       RequestType.GET,
       '/client/r0/directory/list/room/${Uri.encodeComponent(roomId)}',
     );
-    return Visibility.values.firstWhere(
-        (v) => v.toString().split('.').last == response['visibility']);
+    return Visibility.values
+        .firstWhere((v) => describeEnum(v) == response['visibility']);
   }
 
   /// Sets the visibility of a given room in the server's public room directory.
@@ -1078,7 +1058,7 @@ class MatrixApi {
       RequestType.PUT,
       '/client/r0/directory/list/room/${Uri.encodeComponent(roomId)}',
       data: {
-        'visibility': visibility.toString().split('.').last,
+        'visibility': describeEnum(visibility),
       },
     );
     return;
@@ -1091,26 +1071,14 @@ class MatrixApi {
     String since,
     String server,
   }) async {
-    var action = '/client/r0/publicRooms';
-    var atLeastOneParameter = false;
-    if (limit != null) {
-      action += atLeastOneParameter ? '&' : '?';
-      action += 'limit=${Uri.encodeQueryComponent(limit.toString())}';
-      atLeastOneParameter = true;
-    }
-    if (since != null) {
-      action += atLeastOneParameter ? '&' : '?';
-      action += 'since=${Uri.encodeQueryComponent(since.toString())}';
-      atLeastOneParameter = true;
-    }
-    if (server != null) {
-      action += atLeastOneParameter ? '&' : '?';
-      action += 'server=${Uri.encodeQueryComponent(server.toString())}';
-      atLeastOneParameter = true;
-    }
     final response = await request(
       RequestType.GET,
-      action,
+      '/client/r0/publicRooms',
+      query: {
+        if (limit != null) 'limit': limit.toString(),
+        if (since != null) 'since': since,
+        if (server != null) 'server': server,
+      },
     );
     return PublicRoomsResponse.fromJson(response);
   }
@@ -1125,13 +1093,12 @@ class MatrixApi {
     bool includeAllNetworks,
     String thirdPartyInstanceId,
   }) async {
-    var action = '/client/r0/publicRooms';
-    if (server != null) {
-      action += '?server=${Uri.encodeQueryComponent(server.toString())}';
-    }
     final response = await request(
       RequestType.POST,
-      action,
+      '/client/r0/publicRooms',
+      query: {
+        if (server != null) 'server': server,
+      },
       data: {
         if (limit != null) 'limit': limit,
         if (since != null) 'since': since,
@@ -1298,7 +1265,7 @@ class MatrixApi {
       RequestType.PUT,
       '/client/r0/presence/${Uri.encodeComponent(userId)}/status',
       data: {
-        'presence': presenceType.toString().split('.').last,
+        'presence': describeEnum(presenceType),
         if (statusMsg != null) 'status_msg': statusMsg,
       },
     );
@@ -1323,7 +1290,8 @@ class MatrixApi {
     fileName = fileName.split('/').last;
     var headers = <String, String>{};
     headers['Authorization'] = 'Bearer $accessToken';
-    headers['Content-Type'] = contentType ?? mime(fileName);
+    headers['Content-Type'] =
+        contentType ?? lookupMimeType(fileName, headerBytes: file);
     fileName = Uri.encodeQueryComponent(fileName);
     final url =
         '${homeserver.toString()}/_matrix/media/r0/upload?filename=$fileName';
@@ -1342,7 +1310,7 @@ class MatrixApi {
               .codeUnits
           : await streamedResponse.stream.first),
     );
-    if (!jsonResponse.containsKey('content_uri')) {
+    if (!(jsonResponse['content_uri'] is String)) {
       throw MatrixException.fromJson(jsonResponse);
     }
     return jsonResponse['content_uri'];
@@ -1503,6 +1471,55 @@ class MatrixApi {
     return DeviceListsUpdate.fromJson(response);
   }
 
+  /// Uploads your own cross-signing keys.
+  /// https://github.com/matrix-org/matrix-doc/pull/2536
+  Future<void> uploadDeviceSigningKeys({
+    MatrixCrossSigningKey masterKey,
+    MatrixCrossSigningKey selfSigningKey,
+    MatrixCrossSigningKey userSigningKey,
+  }) async {
+    await request(
+      RequestType.POST,
+      '/client/r0/keys/device_signing/upload',
+      data: {
+        'master_key': masterKey.toJson(),
+        'self_signing_key': selfSigningKey.toJson(),
+        'user_signing_key': userSigningKey.toJson(),
+      },
+    );
+  }
+
+  /// Uploads new signatures of keys
+  /// https://github.com/matrix-org/matrix-doc/pull/2536
+  Future<UploadKeySignaturesResponse> uploadKeySignatures(
+      List<MatrixSignableKey> keys) async {
+    final payload = <String, dynamic>{};
+    for (final key in keys) {
+      if (key.identifier == null ||
+          key.signatures == null ||
+          key.signatures.isEmpty) {
+        continue;
+      }
+      if (!payload.containsKey(key.userId)) {
+        payload[key.userId] = <String, dynamic>{};
+      }
+      if (payload[key.userId].containsKey(key.identifier)) {
+        // we need to merge signature objects
+        payload[key.userId][key.identifier]['signatures']
+            .addAll(key.signatures);
+      } else {
+        // we can just add signatures
+        payload[key.userId][key.identifier] = key.toJson();
+      }
+    }
+    final response = await request(
+      RequestType.POST,
+      '/client/r0/keys/signatures/upload',
+      data: payload,
+    );
+    return UploadKeySignaturesResponse.fromJson(response);
+  }
+
   /// Gets all currently active pushers for the authenticated user.
   /// https://matrix.org/docs/spec/client_server/r0.6.1#get-matrix-client-r0-pushers
   Future<List<Pusher>> requestPushers() async {
@@ -1540,26 +1557,14 @@ class MatrixApi {
     int limit,
     String only,
   }) async {
-    var action = '/client/r0/notifications';
-    var atLeastOneParameter = false;
-    if (from != null) {
-      action += atLeastOneParameter ? '&' : '?';
-      action += 'from=${Uri.encodeQueryComponent(from.toString())}';
-      atLeastOneParameter = true;
-    }
-    if (limit != null) {
-      action += atLeastOneParameter ? '&' : '?';
-      action += 'limit=${Uri.encodeQueryComponent(limit.toString())}';
-      atLeastOneParameter = true;
-    }
-    if (only != null) {
-      action += atLeastOneParameter ? '&' : '?';
-      action += 'only=${Uri.encodeQueryComponent(only.toString())}';
-      atLeastOneParameter = true;
-    }
     final response = await request(
       RequestType.GET,
-      action,
+      '/client/r0/notifications',
+      query: {
+        if (from != null) 'from': from,
+        if (limit != null) 'limit': limit.toString(),
+        if (only != null) 'only': only,
+      },
     );
     return NotificationsQueryResponse.fromJson(response);
   }
@@ -1585,7 +1590,7 @@ class MatrixApi {
   ) async {
     final response = await request(
       RequestType.GET,
-      '/client/r0/pushrules/${Uri.encodeComponent(scope)}/${Uri.encodeComponent(kind.toString().split('.').last)}/${Uri.encodeComponent(ruleId)}',
+      '/client/r0/pushrules/${Uri.encodeComponent(scope)}/${Uri.encodeComponent(describeEnum(kind))}/${Uri.encodeComponent(ruleId)}',
     );
     return PushRule.fromJson(response);
   }
@@ -1599,7 +1604,7 @@ class MatrixApi {
   ) async {
     await request(
       RequestType.DELETE,
-      '/client/r0/pushrules/${Uri.encodeComponent(scope)}/${Uri.encodeComponent(kind.toString().split('.').last)}/${Uri.encodeComponent(ruleId)}',
+      '/client/r0/pushrules/${Uri.encodeComponent(scope)}/${Uri.encodeComponent(describeEnum(kind))}/${Uri.encodeComponent(ruleId)}',
     );
     return;
   }
@@ -1617,26 +1622,18 @@ class MatrixApi {
     List<PushConditions> conditions,
     String pattern,
   }) async {
-    var action =
-        '/client/r0/pushrules/${Uri.encodeComponent(scope)}/${Uri.encodeComponent(kind.toString().split('.').last)}/${Uri.encodeComponent(ruleId)}';
-    var atLeastOneParameter = false;
-    if (before != null) {
-      action += atLeastOneParameter ? '&' : '?';
-      action += 'before=${Uri.encodeQueryComponent(before.toString())}';
-      atLeastOneParameter = true;
-    }
-    if (after != null) {
-      action += atLeastOneParameter ? '&' : '?';
-      action += 'after=${Uri.encodeQueryComponent(after.toString())}';
-      atLeastOneParameter = true;
-    }
-    await request(RequestType.PUT, action, data: {
-      'actions': actions.map((i) => i.toString().split('.').last).toList(),
-      if (conditions != null)
-        'conditions':
-            conditions.map((i) => i.toString().split('.').last).toList(),
-      if (pattern != null) 'pattern': pattern,
-    });
+    await request(RequestType.PUT,
+        '/client/r0/pushrules/${Uri.encodeComponent(scope)}/${Uri.encodeComponent(describeEnum(kind))}/${Uri.encodeComponent(ruleId)}',
+        query: {
+          if (before != null) 'before': before,
+          if (after != null) 'after': after,
+        },
+        data: {
+          'actions': actions.map(describeEnum).toList(),
+          if (conditions != null)
+            'conditions': conditions.map((c) => c.toJson()).toList(),
+          if (pattern != null) 'pattern': pattern,
+        });
     return;
   }
 
@@ -1649,7 +1646,7 @@ class MatrixApi {
   ) async {
     final response = await request(
       RequestType.GET,
-      '/client/r0/pushrules/${Uri.encodeComponent(scope)}/${Uri.encodeComponent(kind.toString().split('.').last)}/${Uri.encodeComponent(ruleId)}/enabled',
+      '/client/r0/pushrules/${Uri.encodeComponent(scope)}/${Uri.encodeComponent(describeEnum(kind))}/${Uri.encodeComponent(ruleId)}/enabled',
     );
     return response['enabled'];
   }
@@ -1664,7 +1661,7 @@ class MatrixApi {
   ) async {
     await request(
       RequestType.PUT,
-      '/client/r0/pushrules/${Uri.encodeComponent(scope)}/${Uri.encodeComponent(kind.toString().split('.').last)}/${Uri.encodeComponent(ruleId)}/enabled',
+      '/client/r0/pushrules/${Uri.encodeComponent(scope)}/${Uri.encodeComponent(describeEnum(kind))}/${Uri.encodeComponent(ruleId)}/enabled',
       data: {'enabled': enabled},
     );
     return;
@@ -1679,11 +1676,11 @@ class MatrixApi {
   ) async {
     final response = await request(
       RequestType.GET,
-      '/client/r0/pushrules/${Uri.encodeComponent(scope)}/${Uri.encodeComponent(kind.toString().split('.').last)}/${Uri.encodeComponent(ruleId)}/actions',
+      '/client/r0/pushrules/${Uri.encodeComponent(scope)}/${Uri.encodeComponent(describeEnum(kind))}/${Uri.encodeComponent(ruleId)}/actions',
     );
     return (response['actions'] as List)
-        .map((i) => PushRuleAction.values
-            .firstWhere((a) => a.toString().split('.').last == i))
+        .map((i) =>
+            PushRuleAction.values.firstWhere((a) => describeEnum(a) == i))
         .toList();
   }
 
@@ -1697,10 +1694,8 @@ class MatrixApi {
   ) async {
     await request(
       RequestType.PUT,
-      '/client/r0/pushrules/${Uri.encodeComponent(scope)}/${Uri.encodeComponent(kind.toString().split('.').last)}/${Uri.encodeComponent(ruleId)}/actions',
-      data: {
-        'actions': actions.map((a) => a.toString().split('.').last).toList()
-      },
+      '/client/r0/pushrules/${Uri.encodeComponent(scope)}/${Uri.encodeComponent(describeEnum(kind))}/${Uri.encodeComponent(ruleId)}/actions',
+      data: {'actions': actions.map((a) => describeEnum(a)).toList()},
     );
     return;
   }
@@ -1725,24 +1720,12 @@ class MatrixApi {
     int timeout,
     String roomId,
   }) async {
-    var action = '/client/r0/events';
-    var atLeastOneParameter = false;
-    if (from != null) {
-      action += atLeastOneParameter ? '&' : '?';
-      action += 'from=${Uri.encodeQueryComponent(from)}';
-      atLeastOneParameter = true;
-    }
-    if (timeout != null) {
-      action += atLeastOneParameter ? '&' : '?';
-      action += 'timeout=${Uri.encodeQueryComponent(timeout.toString())}';
-      atLeastOneParameter = true;
-    }
-    if (roomId != null) {
-      action += atLeastOneParameter ? '&' : '?';
-      action += 'roomId=${Uri.encodeQueryComponent(roomId)}';
-      atLeastOneParameter = true;
-    }
-    final response = await request(RequestType.GET, action);
+    final response =
+        await request(RequestType.GET, '/client/r0/events', query: {
+      if (from != null) 'from': from,
+      if (timeout != null) 'timeout': timeout.toString(),
+      if (roomId != null) 'roomId': roomId,
+    });
     return EventsSyncUpdate.fromJson(response);
   }
 
@@ -1861,20 +1844,12 @@ class MatrixApi {
     int limit,
     String filter,
   }) async {
-    var action =
-        '/client/r0/rooms/${Uri.encodeQueryComponent(roomId)}/context/${Uri.encodeQueryComponent(eventId)}';
-    var atLeastOneParameter = false;
-    if (filter != null) {
-      action += atLeastOneParameter ? '&' : '?';
-      action += 'filter=${Uri.encodeQueryComponent(filter)}';
-      atLeastOneParameter = true;
-    }
-    if (limit != null) {
-      action += atLeastOneParameter ? '&' : '?';
-      action += 'limit=${Uri.encodeQueryComponent(limit.toString())}';
-      atLeastOneParameter = true;
-    }
-    final response = await request(RequestType.GET, action);
+    final response = await request(RequestType.GET,
+        '/client/r0/rooms/${Uri.encodeQueryComponent(roomId)}/context/${Uri.encodeQueryComponent(eventId)}',
+        query: {
+          if (filter != null) 'filter': filter,
+          if (limit != null) 'limit': limit.toString(),
+        });
     return EventContext.fromJson(response);
   }
 
@@ -1985,5 +1960,157 @@ class MatrixApi {
       data: {'new_version': version},
     );
     return;
+  }
+
+  /// Create room keys backup
+  /// https://matrix.org/docs/spec/client_server/unstable#post-matrix-client-r0-room-keys-version
+  Future<String> createRoomKeysBackup(
+      RoomKeysAlgorithmType algorithm, Map<String, dynamic> authData) async {
+    final ret = await request(
+      RequestType.POST,
+      '/client/unstable/room_keys/version',
+      data: {
+        'algorithm': algorithm.algorithmString,
+        'auth_data': authData,
+      },
+    );
+    return ret['version'];
+  }
+
+  /// Gets a room key backup
+  /// https://matrix.org/docs/spec/client_server/unstable#get-matrix-client-r0-room-keys-version
+  Future<RoomKeysVersionResponse> getRoomKeysBackup([String version]) async {
+    var url = '/client/unstable/room_keys/version';
+    if (version != null) {
+      url += '/${Uri.encodeComponent(version)}';
+    }
+    final ret = await request(
+      RequestType.GET,
+      url,
+    );
+    return RoomKeysVersionResponse.fromJson(ret);
+  }
+
+  /// Updates a room key backup
+  /// https://matrix.org/docs/spec/client_server/unstable#put-matrix-client-r0-room-keys-version-version
+  Future<void> updateRoomKeysBackup(String version,
+      RoomKeysAlgorithmType algorithm, Map<String, dynamic> authData) async {
+    await request(
+      RequestType.PUT,
+      '/client/unstable/room_keys/version/${Uri.encodeComponent(version)}',
+      data: {
+        'algorithm': algorithm.algorithmString,
+        'auth_data': authData,
+        'version': version,
+      },
+    );
+  }
+
+  /// Deletes a room key backup
+  /// https://matrix.org/docs/spec/client_server/unstable#delete-matrix-client-r0-room-keys-version-version
+  Future<void> deleteRoomKeysBackup(String version) async {
+    await request(
+      RequestType.DELETE,
+      '/client/unstable/room_keys/version/${Uri.encodeComponent(version)}',
+    );
+  }
+
+  /// Stores a single room key
+  /// https://matrix.org/docs/spec/client_server/unstable#put-matrix-client-r0-room-keys-keys-roomid-sessionid
+  Future<RoomKeysUpdateResponse> storeRoomKeysSingleKey(String roomId,
+      String sessionId, String version, RoomKeysSingleKey session) async {
+    final ret = await request(
+      RequestType.PUT,
+      '/client/unstable/room_keys/keys/${Uri.encodeComponent(roomId)}/${Uri.encodeComponent(sessionId)}?version=${Uri.encodeComponent(version)}',
+      data: session.toJson(),
+    );
+    return RoomKeysUpdateResponse.fromJson(ret);
+  }
+
+  /// Gets a single room key
+  /// https://matrix.org/docs/spec/client_server/unstable#get-matrix-client-r0-room-keys-keys-roomid-sessionid
+  Future<RoomKeysSingleKey> getRoomKeysSingleKey(
+      String roomId, String sessionId, String version) async {
+    final ret = await request(
+      RequestType.GET,
+      '/client/unstable/room_keys/keys/${Uri.encodeComponent(roomId)}/${Uri.encodeComponent(sessionId)}?version=${Uri.encodeComponent(version)}',
+    );
+    return RoomKeysSingleKey.fromJson(ret);
+  }
+
+  /// Deletes a single room key
+  /// https://matrix.org/docs/spec/client_server/unstable#delete-matrix-client-r0-room-keys-keys-roomid-sessionid
+  Future<RoomKeysUpdateResponse> deleteRoomKeysSingleKey(
+      String roomId, String sessionId, String version) async {
+    final ret = await request(
+      RequestType.DELETE,
+      '/client/unstable/room_keys/keys/${Uri.encodeComponent(roomId)}/${Uri.encodeComponent(sessionId)}?version=${Uri.encodeComponent(version)}',
+    );
+    return RoomKeysUpdateResponse.fromJson(ret);
+  }
+
+  /// Stores room keys for a room
+  /// https://matrix.org/docs/spec/client_server/unstable#put-matrix-client-r0-room-keys-keys-roomid
+  Future<RoomKeysUpdateResponse> storeRoomKeysRoom(
+      String roomId, String version, RoomKeysRoom keys) async {
+    final ret = await request(
+      RequestType.PUT,
+      '/client/unstable/room_keys/keys/${Uri.encodeComponent(roomId)}?version=${Uri.encodeComponent(version)}',
+      data: keys.toJson(),
+    );
+    return RoomKeysUpdateResponse.fromJson(ret);
+  }
+
+  /// Gets room keys for a room
+  /// https://matrix.org/docs/spec/client_server/unstable#get-matrix-client-r0-room-keys-keys-roomid
+  Future<RoomKeysRoom> getRoomKeysRoom(String roomId, String version) async {
+    final ret = await request(
+      RequestType.GET,
+      '/client/unstable/room_keys/keys/${Uri.encodeComponent(roomId)}?version=${Uri.encodeComponent(version)}',
+    );
+    return RoomKeysRoom.fromJson(ret);
+  }
+
+  /// Deletes room ekys for a room
+  /// https://matrix.org/docs/spec/client_server/unstable#delete-matrix-client-r0-room-keys-keys-roomid
+  Future<RoomKeysUpdateResponse> deleteRoomKeysRoom(
+      String roomId, String version) async {
+    final ret = await request(
+      RequestType.DELETE,
+      '/client/unstable/room_keys/keys/${Uri.encodeComponent(roomId)}?version=${Uri.encodeComponent(version)}',
+    );
+    return RoomKeysUpdateResponse.fromJson(ret);
+  }
+
+  /// Store multiple room keys
+  /// https://matrix.org/docs/spec/client_server/unstable#put-matrix-client-r0-room-keys-keys
+  Future<RoomKeysUpdateResponse> storeRoomKeys(
+      String version, RoomKeys keys) async {
+    final ret = await request(
+      RequestType.PUT,
+      '/client/unstable/room_keys/keys?version=${Uri.encodeComponent(version)}',
+      data: keys.toJson(),
+    );
+    return RoomKeysUpdateResponse.fromJson(ret);
+  }
+
+  /// get all room keys
+  /// https://matrix.org/docs/spec/client_server/unstable#get-matrix-client-r0-room-keys-keys
+  Future<RoomKeys> getRoomKeys(String version) async {
+    final ret = await request(
+      RequestType.GET,
+      '/client/unstable/room_keys/keys?version=${Uri.encodeComponent(version)}',
+    );
+    return RoomKeys.fromJson(ret);
+  }
+
+  /// delete all room keys
+  /// https://matrix.org/docs/spec/client_server/unstable#delete-matrix-client-r0-room-keys-keys
+  Future<RoomKeysUpdateResponse> deleteRoomKeys(String version) async {
+    final ret = await request(
+      RequestType.DELETE,
+      '/client/unstable/room_keys/keys?version=${Uri.encodeComponent(version)}',
+    );
+    return RoomKeysUpdateResponse.fromJson(ret);
   }
 }

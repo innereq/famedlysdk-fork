@@ -127,7 +127,7 @@ void main() {
       }
       expect(sync.nextBatch == matrix.prevBatch, true);
 
-      expect(matrix.accountData.length, 3);
+      expect(matrix.accountData.length, 9);
       expect(matrix.getDirectChatFromUserId('@bob:example.com'),
           '!726s6s6q:example.com');
       expect(matrix.rooms[1].directChatMatrixID, '@bob:example.com');
@@ -151,13 +151,10 @@ void main() {
       expect(matrix.rooms.length, 2);
       expect(matrix.rooms[1].canonicalAlias,
           "#famedlyContactDiscovery:${matrix.userID.split(":")[1]}");
-      final contacts = await matrix.loadFamedlyContacts();
-      expect(contacts.length, 2);
-      expect(contacts[0].senderId, '@alice:example.com');
       expect(matrix.presences['@alice:example.com'].presence.presence,
           PresenceType.online);
       expect(presenceCounter, 1);
-      expect(accountDataCounter, 3);
+      expect(accountDataCounter, 9);
       await Future.delayed(Duration(milliseconds: 50));
       expect(matrix.userDeviceKeys.length, 4);
       expect(matrix.userDeviceKeys['@alice:example.com'].outdated, false);
@@ -207,10 +204,6 @@ void main() {
           matrix.getRoomByAlias(
               "#famedlyContactDiscovery:${matrix.userID.split(":")[1]}"),
           null);
-      final altContacts = await matrix.loadFamedlyContacts();
-      altContacts.forEach((u) => print(u.id));
-      expect(altContacts.length, 2);
-      expect(altContacts[0].senderId, '@alice:example.com');
     });
 
     test('Logout', () async {
@@ -258,7 +251,7 @@ void main() {
 
       var eventUpdateList = await eventUpdateListFuture;
 
-      expect(eventUpdateList.length, 13);
+      expect(eventUpdateList.length, 14);
 
       expect(eventUpdateList[0].eventType, 'm.room.member');
       expect(eventUpdateList[0].roomID, '!726s6s6q:example.com');
@@ -272,41 +265,45 @@ void main() {
       expect(eventUpdateList[2].roomID, '!726s6s6q:example.com');
       expect(eventUpdateList[2].type, 'state');
 
-      expect(eventUpdateList[3].eventType, 'm.room.member');
+      expect(eventUpdateList[3].eventType, 'm.room.pinned_events');
       expect(eventUpdateList[3].roomID, '!726s6s6q:example.com');
-      expect(eventUpdateList[3].type, 'timeline');
+      expect(eventUpdateList[3].type, 'state');
 
-      expect(eventUpdateList[4].eventType, 'm.room.message');
+      expect(eventUpdateList[4].eventType, 'm.room.member');
       expect(eventUpdateList[4].roomID, '!726s6s6q:example.com');
       expect(eventUpdateList[4].type, 'timeline');
 
-      expect(eventUpdateList[5].eventType, 'm.typing');
+      expect(eventUpdateList[5].eventType, 'm.room.message');
       expect(eventUpdateList[5].roomID, '!726s6s6q:example.com');
-      expect(eventUpdateList[5].type, 'ephemeral');
+      expect(eventUpdateList[5].type, 'timeline');
 
-      expect(eventUpdateList[6].eventType, 'm.receipt');
+      expect(eventUpdateList[6].eventType, 'm.typing');
       expect(eventUpdateList[6].roomID, '!726s6s6q:example.com');
       expect(eventUpdateList[6].type, 'ephemeral');
 
       expect(eventUpdateList[7].eventType, 'm.receipt');
       expect(eventUpdateList[7].roomID, '!726s6s6q:example.com');
-      expect(eventUpdateList[7].type, 'account_data');
+      expect(eventUpdateList[7].type, 'ephemeral');
 
-      expect(eventUpdateList[8].eventType, 'm.tag');
+      expect(eventUpdateList[8].eventType, 'm.receipt');
       expect(eventUpdateList[8].roomID, '!726s6s6q:example.com');
       expect(eventUpdateList[8].type, 'account_data');
 
-      expect(eventUpdateList[9].eventType, 'org.example.custom.room.config');
+      expect(eventUpdateList[9].eventType, 'm.tag');
       expect(eventUpdateList[9].roomID, '!726s6s6q:example.com');
       expect(eventUpdateList[9].type, 'account_data');
 
-      expect(eventUpdateList[10].eventType, 'm.room.name');
-      expect(eventUpdateList[10].roomID, '!696r7674:example.com');
-      expect(eventUpdateList[10].type, 'invite_state');
+      expect(eventUpdateList[10].eventType, 'org.example.custom.room.config');
+      expect(eventUpdateList[10].roomID, '!726s6s6q:example.com');
+      expect(eventUpdateList[10].type, 'account_data');
 
-      expect(eventUpdateList[11].eventType, 'm.room.member');
+      expect(eventUpdateList[11].eventType, 'm.room.name');
       expect(eventUpdateList[11].roomID, '!696r7674:example.com');
       expect(eventUpdateList[11].type, 'invite_state');
+
+      expect(eventUpdateList[12].eventType, 'm.room.member');
+      expect(eventUpdateList[12].roomID, '!696r7674:example.com');
+      expect(eventUpdateList[12].type, 'invite_state');
     });
 
     test('To Device Update Test', () async {
@@ -339,8 +336,7 @@ void main() {
     });
 
     test('setAvatar', () async {
-      final testFile =
-          MatrixFile(bytes: Uint8List(0), path: 'fake/path/file.jpeg');
+      final testFile = MatrixFile(bytes: Uint8List(0), name: 'file.jpeg');
       await matrix.setAvatar(testFile);
     });
 
@@ -388,7 +384,7 @@ void main() {
               'dSO80A01XiigH3uBiDVx/EjzaoycHcjq9lfQX0uWsqxl2giMIiSPR8a4d291W1ihKJL/a+myXS367WT6NAIcBA'
         }
       }
-    });
+    }, matrix);
     test('sendToDevice', () async {
       await matrix.sendToDevice(
           [deviceKeys],

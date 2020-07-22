@@ -1,6 +1,6 @@
 /*
  *   Famedly Matrix SDK
- *   Copyright (C) 2019, 2020 Famedly GmbH
+ *   Copyright (C) 2020 Famedly GmbH
  *
  *   This program is free software: you can redistribute it and/or modify
  *   it under the terms of the GNU Affero General Public License as
@@ -16,31 +16,39 @@
  *   along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-import 'well_known_informations.dart';
+import 'matrix_exception.dart';
 
-class LoginResponse {
-  String userId;
-  String accessToken;
-  String deviceId;
-  WellKnownInformations wellKnownInformations;
+class UploadKeySignaturesResponse {
+  Map<String, Map<String, MatrixException>> failures;
 
-  LoginResponse.fromJson(Map<String, dynamic> json) {
-    userId = json['user_id'];
-    accessToken = json['access_token'];
-    deviceId = json['device_id'];
-    if (json['well_known'] is Map) {
-      wellKnownInformations =
-          WellKnownInformations.fromJson(json['well_known']);
-    }
+  UploadKeySignaturesResponse.fromJson(Map<String, dynamic> json) {
+    failures = json['failures'] != null
+        ? (json['failures'] as Map).map(
+            (k, v) => MapEntry(
+              k,
+              (v as Map).map((k, v) => MapEntry(
+                    k,
+                    MatrixException.fromJson(v),
+                  )),
+            ),
+          )
+        : null;
   }
 
   Map<String, dynamic> toJson() {
     final data = <String, dynamic>{};
-    if (userId != null) data['user_id'] = userId;
-    if (accessToken != null) data['access_token'] = accessToken;
-    if (deviceId != null) data['device_id'] = deviceId;
-    if (wellKnownInformations != null) {
-      data['well_known'] = wellKnownInformations.toJson();
+    if (failures != null) {
+      data['failures'] = failures.map(
+        (k, v) => MapEntry(
+          k,
+          v.map(
+            (k, v) => MapEntry(
+              k,
+              v.raw,
+            ),
+          ),
+        ),
+      );
     }
     return data;
   }

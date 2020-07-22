@@ -15,8 +15,10 @@ part 'database.g.dart';
 class Database extends _$Database {
   Database(QueryExecutor e) : super(e);
 
+  Database.connect(DatabaseConnection connection) : super.connect(connection);
+
   @override
-  int get schemaVersion => 3;
+  int get schemaVersion => 5;
 
   int get maxFileSize => 1 * 1024 * 1024;
 
@@ -44,6 +46,28 @@ class Database extends _$Database {
           if (from == 2) {
             await m.deleteTable('outbound_group_sessions');
             await m.createTable(outboundGroupSessions);
+            from++;
+          }
+          if (from == 3) {
+            await m.createTable(userCrossSigningKeys);
+            await m.createTable(ssssCache);
+            // mark all keys as outdated so that the cross signing keys will be fetched
+            await m.issueCustomQuery(
+                'UPDATE user_device_keys SET outdated = true');
+            from++;
+          }
+          if (from == 4) {
+            await m.addColumn(olmSessions, olmSessions.lastReceived);
+            from++;
+          }
+        },
+        beforeOpen: (_) async {
+          if (executor.dialect == SqlDialect.sqlite) {
+            final ret = await customSelect('PRAGMA journal_mode=WAL').get();
+            if (ret.isNotEmpty) {
+              print('[Moor] Switched database to mode ' +
+                  ret.first.data['journal_mode'].toString());
+            }
           }
         },
       );
@@ -55,16 +79,20 @@ class Database extends _$Database {
   }
 
   Future<Map<String, sdk.DeviceKeysList>> getUserDeviceKeys(
-      int clientId) async {
-    final deviceKeys = await getAllUserDeviceKeys(clientId).get();
+      sdk.Client client) async {
+    final deviceKeys = await getAllUserDeviceKeys(client.id).get();
     if (deviceKeys.isEmpty) {
       return {};
     }
-    final deviceKeysKeys = await getAllUserDeviceKeysKeys(clientId).get();
+    final deviceKeysKeys = await getAllUserDeviceKeysKeys(client.id).get();
+    final crossSigningKeys = await getAllUserCrossSigningKeys(client.id).get();
     final res = <String, sdk.DeviceKeysList>{};
     for (final entry in deviceKeys) {
-      res[entry.userId] = sdk.DeviceKeysList.fromDb(entry,
-          deviceKeysKeys.where((k) => k.userId == entry.userId).toList());
+      res[entry.userId] = sdk.DeviceKeysList.fromDb(
+          entry,
+          deviceKeysKeys.where((k) => k.userId == entry.userId).toList(),
+          crossSigningKeys.where((k) => k.userId == entry.userId).toList(),
+          client);
     }
     return res;
   }
@@ -84,22 +112,6 @@ class Database extends _$Database {
         var session = olm.Session();
         session.unpickle(userId, row.pickle);
         res[row.identityKey].add(session);
-      } catch (e) {
-        print('[LibOlm] Could not unpickle olm session: ' + e.toString());
-      }
-    }
-    return res;
-  }
-
-  Future<List<olm.Session>> getSingleOlmSessions(
-      int clientId, String identityKey, String userId) async {
-    final rows = await dbGetOlmSessions(clientId, identityKey).get();
-    final res = <olm.Session>[];
-    for (final row in rows) {
-      try {
-        var session = olm.Session();
-        session.unpickle(userId, row.pickle);
-        res.add(session);
       } catch (e) {
         print('[LibOlm] Could not unpickle olm session: ' + e.toString());
       }
@@ -131,6 +143,14 @@ class Database extends _$Database {
     return res.first;
   }
 
+  Future<DbSSSSCache> getSSSSCache(int clientId, String type) async {
+    final res = await dbGetSSSSCache(clientId, type).get();
+    if (res.isEmpty) {
+      return null;
+    }
+    return res.first;
+  }
+
   Future<List<sdk.Room>> getRoomList(sdk.Client client,
       {bool onlyLeft = false}) async {
     final res = await (select(rooms)
@@ -138,9 +158,12 @@ class Database extends _$Database {
               ? t.membership.equals('leave')
               : t.membership.equals('leave').not()))
         .get();
-    final resStates = await getAllRoomStates(client.id).get();
+    final resStates = await getImportantRoomStates(
+            client.id, client.importantStateEvents.toList())
+        .get();
     final resAccountData = await getAllRoomAccountData(client.id).get();
     final roomList = <sdk.Room>[];
+    final allMembersToPostload = <String, Set<String>>{};
     for (final r in res) {
       final room = await sdk.Room.getRoomFromTableRow(
         r,
@@ -149,6 +172,81 @@ class Database extends _$Database {
         roomAccountData: resAccountData.where((rs) => rs.roomId == r.roomId),
       );
       roomList.add(room);
+      // let's see if we need any m.room.member events
+      final membersToPostload = <String>{};
+      // the lastEvent message preview might have an author we need to fetch, if it is a group chat
+      if (room.getState(EventTypes.Message) != null && !room.isDirectChat) {
+        membersToPostload.add(room.getState(EventTypes.Message).senderId);
+      }
+      // if the room has no name and no canonical alias, its name is calculated
+      // based on the heroes of the room
+      if (room.getState(EventTypes.RoomName) == null &&
+          room.getState(EventTypes.RoomCanonicalAlias) == null &&
+          room.mHeroes != null) {
+        // we don't have a name and no canonical alias, so we'll need to
+        // post-load the heroes
+        membersToPostload.addAll(room.mHeroes.where((h) => h.isNotEmpty));
+      }
+      // okay, only load from the database if we actually have stuff to load
+      if (membersToPostload.isNotEmpty) {
+        // save it for loading later
+        allMembersToPostload[room.id] = membersToPostload;
+      }
+    }
+    // now we postload all members, if thre are any
+    if (allMembersToPostload.isNotEmpty) {
+      // we will generate a query to fetch as many events as possible at once, as that
+      // significantly improves performance. However, to prevent too large queries from being constructed,
+      // we limit to only fetching 500 rooms at once.
+      // This value might be fine-tune-able to be larger (and thus increase performance more for very large accounts),
+      // however this very conservative value should be on the safe side.
+      const MAX_ROOMS_PER_QUERY = 500;
+      // as we iterate over our entries in separate chunks one-by-one we use an iterator
+      // which persists accross the chunks, and thus we just re-sume iteration at the place
+      // we prreviously left off.
+      final entriesIterator = allMembersToPostload.entries.iterator;
+      // now we iterate over all our 500-room-chunks...
+      for (var i = 0;
+          i < allMembersToPostload.keys.length;
+          i += MAX_ROOMS_PER_QUERY) {
+        // query the current chunk and build the query
+        final membersRes = await (select(roomStates)
+              ..where((s) {
+                // all chunks have to have the reight client id and must be of type `m.room.member`
+                final basequery = s.clientId.equals(client.id) &
+                    s.type.equals('m.room.member');
+                // this is where the magic happens. Here we build a query with the form
+                // OR room_id = '!roomId1' AND state_key IN ('@member') OR room_id = '!roomId2' AND state_key IN ('@member')
+                // subqueries holds our query fragment
+                Expression<bool> subqueries;
+                // here we iterate over our chunk....we musn't forget to progress our iterator!
+                // we must check for if our chunk is done *before* progressing the
+                // iterator, else we might progress it twice around chunk edges, missing on rooms
+                for (var j = 0;
+                    j < MAX_ROOMS_PER_QUERY && entriesIterator.moveNext();
+                    j++) {
+                  final entry = entriesIterator.current;
+                  // builds room_id = '!roomId1' AND state_key IN ('@member')
+                  final q =
+                      s.roomId.equals(entry.key) & s.stateKey.isIn(entry.value);
+                  // adds it either as the start of subqueries or as a new OR condition to it
+                  if (subqueries == null) {
+                    subqueries = q;
+                  } else {
+                    subqueries = subqueries | q;
+                  }
+                }
+                // combinde the basequery with the subquery together, giving our final query
+                return basequery & subqueries;
+              }))
+            .get();
+        // now that we got all the entries from the database, set them as room states
+        for (final dbMember in membersRes) {
+          final room = roomList.firstWhere((r) => r.id == dbMember.roomId);
+          final event = sdk.Event.fromDb(dbMember, room);
+          room.setState(event);
+        }
+      }
     }
     return roomList;
   }
@@ -157,29 +255,20 @@ class Database extends _$Database {
     final newAccountData = <String, api.BasicEvent>{};
     final rawAccountData = await getAllAccountData(clientId).get();
     for (final d in rawAccountData) {
-      final content = sdk.Event.getMapFromPayload(d.content);
+      var content = sdk.Event.getMapFromPayload(d.content);
+      // there was a bug where it stored the entire event, not just the content
+      // in the databse. This is the temporary fix for those affected by the bug
+      if (content['content'] is Map && content['type'] is String) {
+        content = content['content'];
+        // and save
+        await storeAccountData(clientId, d.type, jsonEncode(content));
+      }
       newAccountData[d.type] = api.BasicEvent(
         content: content,
         type: d.type,
       );
     }
     return newAccountData;
-  }
-
-  Future<Map<String, api.Presence>> getPresences(int clientId) async {
-    final newPresences = <String, api.Presence>{};
-    final rawPresences = await getAllPresences(clientId).get();
-    for (final d in rawPresences) {
-      // TODO: Why is this not working?
-      try {
-        final content = sdk.Event.getMapFromPayload(d.content);
-        var presence = api.Presence.fromJson(content);
-        presence.senderId = d.sender;
-        presence.type = d.type;
-        newPresences[d.sender] = api.Presence.fromJson(content);
-      } catch (_) {}
-    }
-    return newPresences;
   }
 
   /// Stores a RoomUpdate object in the database. Must be called inside of
@@ -246,23 +335,6 @@ class Database extends _$Database {
     }
   }
 
-  /// Stores an UserUpdate object in the database. Must be called inside of
-  /// [transaction].
-  Future<void> storeUserEventUpdate(
-    int clientId,
-    String type,
-    String eventType,
-    Map<String, dynamic> content,
-  ) async {
-    if (type == 'account_data') {
-      await storeAccountData(
-          clientId, eventType, json.encode(content['content']));
-    } else if (type == 'presence') {
-      await storePresence(clientId, eventType, content['sender'],
-          json.encode(content['content']));
-    }
-  }
-
   /// Stores an EventUpdate object in the database. Must be called inside of
   /// [transaction].
   Future<void> storeEventUpdate(
@@ -322,7 +394,7 @@ class Database extends _$Database {
 
       // is there a transaction id? Then delete the event with this id.
       if (status != -1 &&
-          eventUpdate.content.containsKey('unsigned') &&
+          eventUpdate.content['unsigned'] is Map &&
           eventUpdate.content['unsigned']['transaction_id'] is String) {
         await removeEvent(clientId,
             eventUpdate.content['unsigned']['transaction_id'], chatId);
@@ -436,11 +508,16 @@ class Database extends _$Database {
     await (delete(inboundGroupSessions)
           ..where((r) => r.clientId.equals(clientId)))
         .go();
+    await (delete(ssssCache)..where((r) => r.clientId.equals(clientId))).go();
     await (delete(olmSessions)..where((r) => r.clientId.equals(clientId))).go();
+    await (delete(userCrossSigningKeys)
+          ..where((r) => r.clientId.equals(clientId)))
+        .go();
     await (delete(userDeviceKeysKey)..where((r) => r.clientId.equals(clientId)))
         .go();
     await (delete(userDeviceKeys)..where((r) => r.clientId.equals(clientId)))
         .go();
+    await (delete(ssssCache)..where((r) => r.clientId.equals(clientId))).go();
     await (delete(clients)..where((r) => r.clientId.equals(clientId))).go();
   }
 
@@ -450,6 +527,15 @@ class Database extends _$Database {
       return null;
     }
     return sdk.Event.fromDb(res.first, room).asUser;
+  }
+
+  Future<List<sdk.User>> getUsers(int clientId, sdk.Room room) async {
+    final res = await dbGetUsers(clientId, room.id).get();
+    final ret = <sdk.User>[];
+    for (final r in res) {
+      ret.add(sdk.Event.fromDb(r, room).asUser);
+    }
+    return ret;
   }
 
   Future<List<sdk.Event>> getEventList(int clientId, sdk.Room room) async {
