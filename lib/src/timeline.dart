@@ -19,6 +19,7 @@
 import 'dart:async';
 
 import 'package:famedlysdk/matrix_api.dart';
+import 'package:famedlysdk/src/utils/logs.dart';
 
 import 'event.dart';
 import 'room.dart';
@@ -34,6 +35,9 @@ typedef onTimelineInsertCallback = void Function(int insertID);
 class Timeline {
   final Room room;
   List<Event> events = [];
+
+  /// Map of event ID to map of type to set of aggregated events
+  Map<String, Map<String, Set<Event>>> aggregatedEvents = {};
 
   final onTimelineUpdateCallback onUpdate;
   final onTimelineInsertCallback onInsert;
@@ -66,7 +70,10 @@ class Timeline {
       await room.requestHistory(
         historyCount: historyCount,
         onHistoryReceived: () {
-          if (room.prev_batch.isEmpty || room.prev_batch == null) events = [];
+          if (room.prev_batch.isEmpty || room.prev_batch == null) {
+            events.clear();
+            aggregatedEvents.clear();
+          }
         },
       );
       await Future.delayed(const Duration(seconds: 2));
@@ -82,9 +89,17 @@ class Timeline {
     // to be received via the onEvent stream, it is unneeded to call sortAndUpdate
     roomSub ??= room.client.onRoomUpdate.stream
         .where((r) => r.id == room.id && r.limitedTimeline == true)
-        .listen((r) => events.clear());
+        .listen((r) {
+      events.clear();
+      aggregatedEvents.clear();
+    });
     sessionIdReceivedSub ??=
         room.onSessionKeyReceived.stream.listen(_sessionKeyReceived);
+
+    // we want to populate our aggregated events
+    for (final e in events) {
+      addAggregatedEvent(e);
+    }
   }
 
   /// Don't forget to call this before you dismiss this object!
@@ -122,12 +137,74 @@ class Timeline {
   }
 
   int _findEvent({String event_id, String unsigned_txid}) {
+    // we want to find any existing event where either the passed event_id or the passed unsigned_txid
+    // matches either the event_id or transaction_id of the existing event.
+    // For that we create two sets, searchNeedle, what we search, and searchHaystack, where we check if there is a match.
+    // Now, after having these two sets, if the intersect between them is non-empty, we know that we have at least one match in one pair,
+    // thus meaning we found our element.
+    final searchNeedle = <String>{};
+    if (event_id != null) {
+      searchNeedle.add(event_id);
+    }
+    if (unsigned_txid != null) {
+      searchNeedle.add(unsigned_txid);
+    }
     int i;
     for (i = 0; i < events.length; i++) {
-      if (events[i].eventId == event_id ||
-          (unsigned_txid != null && events[i].eventId == unsigned_txid)) break;
+      final searchHaystack = <String>{};
+      if (events[i].eventId != null) {
+        searchHaystack.add(events[i].eventId);
+      }
+      if (events[i].unsigned != null &&
+          events[i].unsigned['transaction_id'] != null) {
+        searchHaystack.add(events[i].unsigned['transaction_id']);
+      }
+      if (searchNeedle.intersection(searchHaystack).isNotEmpty) {
+        break;
+      }
     }
     return i;
+  }
+
+  void _removeEventFromSet(Set<Event> eventSet, Event event) {
+    eventSet.removeWhere((e) =>
+        e.matchesEventOrTransactionId(event.eventId) ||
+        (event.unsigned != null &&
+            e.matchesEventOrTransactionId(event.unsigned['transaction_id'])));
+  }
+
+  void addAggregatedEvent(Event event) {
+    // we want to add an event to the aggregation tree
+    if (event.relationshipType == null || event.relationshipEventId == null) {
+      return; // nothing to do
+    }
+    if (!aggregatedEvents.containsKey(event.relationshipEventId)) {
+      aggregatedEvents[event.relationshipEventId] = <String, Set<Event>>{};
+    }
+    if (!aggregatedEvents[event.relationshipEventId]
+        .containsKey(event.relationshipType)) {
+      aggregatedEvents[event.relationshipEventId]
+          [event.relationshipType] = <Event>{};
+    }
+    // remove a potential old event
+    _removeEventFromSet(
+        aggregatedEvents[event.relationshipEventId][event.relationshipType],
+        event);
+    // add the new one
+    aggregatedEvents[event.relationshipEventId][event.relationshipType]
+        .add(event);
+  }
+
+  void removeAggregatedEvent(Event event) {
+    aggregatedEvents.remove(event.eventId);
+    if (event.unsigned != null) {
+      aggregatedEvents.remove(event.unsigned['transaction_id']);
+    }
+    for (final types in aggregatedEvents.values) {
+      for (final events in types.values) {
+        _removeEventFromSet(events, event);
+      }
+    }
   }
 
   void _handleEventUpdate(EventUpdate eventUpdate) async {
@@ -135,20 +212,22 @@ class Timeline {
       if (eventUpdate.roomID != room.id) return;
 
       if (eventUpdate.type == 'timeline' || eventUpdate.type == 'history') {
+        var status = eventUpdate.content['status'] ?? 2;
         // Redaction events are handled as modification for existing events.
         if (eventUpdate.eventType == EventTypes.Redaction) {
           final eventId = _findEvent(event_id: eventUpdate.content['redacts']);
-          if (eventId != null) {
+          if (eventId < events.length) {
+            removeAggregatedEvent(events[eventId]);
             events[eventId].setRedactionEvent(Event.fromJson(
                 eventUpdate.content, room, eventUpdate.sortOrder));
           }
-        } else if (eventUpdate.content['status'] == -2) {
+        } else if (status == -2) {
           var i = _findEvent(event_id: eventUpdate.content['event_id']);
-          if (i < events.length) events.removeAt(i);
-        }
-        // Is this event already in the timeline?
-        else if (eventUpdate.content['unsigned'] is Map &&
-            eventUpdate.content['unsigned']['transaction_id'] is String) {
+          if (i < events.length) {
+            removeAggregatedEvent(events[i]);
+            events.removeAt(i);
+          }
+        } else {
           var i = _findEvent(
               event_id: eventUpdate.content['event_id'],
               unsigned_txid: eventUpdate.content['unsigned'] is Map
@@ -156,41 +235,36 @@ class Timeline {
                   : null);
 
           if (i < events.length) {
+            // we want to preserve the old sort order
             final tempSortOrder = events[i].sortOrder;
+            // if the old status is larger than the new one, we also want to preserve the old status
+            final oldStatus = events[i].status;
             events[i] = Event.fromJson(
                 eventUpdate.content, room, eventUpdate.sortOrder);
             events[i].sortOrder = tempSortOrder;
+            // do we preserve the status? we should allow 0 -> -1 updates and status increases
+            if (status < oldStatus && !(status == -1 && oldStatus == 0)) {
+              events[i].status = oldStatus;
+            }
+            addAggregatedEvent(events[i]);
+          } else {
+            var newEvent = Event.fromJson(
+                eventUpdate.content, room, eventUpdate.sortOrder);
+
+            if (eventUpdate.type == 'history' &&
+                events.indexWhere(
+                        (e) => e.eventId == eventUpdate.content['event_id']) !=
+                    -1) return;
+
+            events.insert(0, newEvent);
+            addAggregatedEvent(newEvent);
+            if (onInsert != null) onInsert(0);
           }
-        } else {
-          Event newEvent;
-          var senderUser = room
-                  .getState(
-                      EventTypes.RoomMember, eventUpdate.content['sender'])
-                  ?.asUser ??
-              await room.client.database?.getUser(
-                  room.client.id, eventUpdate.content['sender'], room);
-          if (senderUser != null) {
-            eventUpdate.content['displayname'] = senderUser.displayName;
-            eventUpdate.content['avatar_url'] = senderUser.avatarUrl.toString();
-          }
-
-          newEvent =
-              Event.fromJson(eventUpdate.content, room, eventUpdate.sortOrder);
-
-          if (eventUpdate.type == 'history' &&
-              events.indexWhere(
-                      (e) => e.eventId == eventUpdate.content['event_id']) !=
-                  -1) return;
-
-          events.insert(0, newEvent);
-          if (onInsert != null) onInsert(0);
         }
       }
       sortAndUpdate();
-    } catch (e) {
-      if (room.client.debug) {
-        print('[WARNING] (_handleEventUpdate) ${e.toString()}');
-      }
+    } catch (e, s) {
+      Logs.warning('Handle event update failed: ${e.toString()}', s);
     }
   }
 

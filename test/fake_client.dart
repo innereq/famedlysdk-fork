@@ -29,21 +29,15 @@ const pickledOlmAccount =
     'N2v1MkIFGcl0mQpo2OCwSopxPQJ0wnl7oe7PKiT4141AijfdTIhRu+ceXzXKy3Kr00nLqXtRv7kid6hU4a+V0rfJWLL0Y51+3Rp/ORDVnQy+SSeo6Fn4FHcXrxifJEJ0djla5u98fBcJ8BSkhIDmtXRPi5/oJAvpiYn+8zMjFHobOeZUAxYR0VfQ9JzSYBsSovoQ7uFkNks1M4EDUvHtuyg3RxViwdNxs3718fyAqQ/VSwbXsY0Nl+qQbF+nlVGHenGqk5SuNl1P6e1PzZxcR0IfXA94Xij1Ob5gDv5YH4UCn9wRMG0abZsQP0YzpDM0FLaHSCyo9i5JD/vMlhH+nZWrgAzPPCTNGYewNV8/h3c+VyJh8ZTx/fVi6Yq46Fv+27Ga2ETRZ3Qn+Oyx6dLBjnBZ9iUvIhqpe2XqaGA1PopOz8iDnaZitw';
 
 Future<Client> getClient() async {
-  final client = Client('testclient', debug: true, httpClient: FakeMatrixApi());
+  final client = Client('testclient', httpClient: FakeMatrixApi());
   client.database = getDatabase();
   await client.checkServer('https://fakeServer.notExisting');
-  final resp = await client.api.login(
-    type: 'm.login.password',
-    user: 'test',
-    password: '1234',
-    initialDeviceDisplayName: 'Fluffy Matrix Client',
-  );
   client.connect(
-    newToken: resp.accessToken,
-    newUserID: resp.userId,
-    newHomeserver: client.api.homeserver,
+    newToken: 'abcd',
+    newUserID: '@test:fakeServer.notExisting',
+    newHomeserver: client.homeserver,
     newDeviceName: 'Text Matrix Client',
-    newDeviceID: resp.deviceId,
+    newDeviceID: 'GHTYAJCE',
     newOlmAccount: pickledOlmAccount,
   );
   await Future.delayed(Duration(milliseconds: 10));

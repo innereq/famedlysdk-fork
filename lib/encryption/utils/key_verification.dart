@@ -19,6 +19,7 @@
 import 'dart:async';
 import 'dart:typed_data';
 import 'package:canonical_json/canonical_json.dart';
+import 'package:famedlysdk/src/utils/logs.dart';
 import 'package:pedantic/pedantic.dart';
 import 'package:olm/olm.dart' as olm;
 import 'package:famedlysdk/famedlysdk.dart';
@@ -150,7 +151,7 @@ class KeyVerification {
   }
 
   void dispose() {
-    print('[Key Verification] disposing object...');
+    Logs.info('[Key Verification] disposing object...');
     method?.dispose();
   }
 
@@ -202,7 +203,8 @@ class KeyVerification {
       await Future.delayed(Duration(milliseconds: 50));
     }
     _handlePayloadLock = true;
-    print('[Key Verification] Received type ${type}: ' + payload.toString());
+    Logs.info(
+        '[Key Verification] Received type ${type}: ' + payload.toString());
     try {
       var thisLastStep = lastStep;
       switch (type) {
@@ -215,7 +217,10 @@ class KeyVerification {
               DateTime.fromMillisecondsSinceEpoch(payload['timestamp']);
           if (now.subtract(Duration(minutes: 10)).isAfter(verifyTime) ||
               now.add(Duration(minutes: 5)).isBefore(verifyTime)) {
-            await cancel('m.timeout');
+            // if the request is more than 20min in the past we just silently fail it
+            // to not generate too many cancels
+            await cancel('m.timeout',
+                now.subtract(Duration(minutes: 20)).isAfter(verifyTime));
             return;
           }
           // verify it has a method we can use
@@ -280,6 +285,13 @@ class KeyVerification {
           }
           method = _makeVerificationMethod(payload['method'], this);
           if (lastStep == null) {
+            // validate the start time
+            if (room != null) {
+              // we just silently ignore in-room-verification starts
+              await cancel('m.unknown_method', true);
+              return;
+            }
+            // validate the specific payload
             if (!method.validateStart(payload)) {
               await cancel('m.unknown_method');
               return;
@@ -287,7 +299,7 @@ class KeyVerification {
             startPaylaod = payload;
             setState(KeyVerificationState.askAccept);
           } else {
-            print('handling start in method.....');
+            Logs.info('handling start in method.....');
             await method.handlePayload(type, payload);
           }
           break;
@@ -301,18 +313,20 @@ class KeyVerification {
           setState(KeyVerificationState.error);
           break;
         default:
-          await method.handlePayload(type, payload);
+          if (method != null) {
+            await method.handlePayload(type, payload);
+          } else {
+            await cancel('m.invalid_message');
+          }
           break;
       }
       if (lastStep == thisLastStep) {
         lastStep = type;
       }
     } catch (err, stacktrace) {
-      print('[Key Verification] An error occured: ' + err.toString());
-      print(stacktrace);
-      if (deviceId != null) {
-        await cancel('m.invalid_message');
-      }
+      Logs.error(
+          '[Key Verification] An error occured: ' + err.toString(), stacktrace);
+      await cancel('m.invalid_message');
     } finally {
       _handlePayloadLock = false;
     }
@@ -510,11 +524,13 @@ class KeyVerification {
     return false;
   }
 
-  Future<void> cancel([String code = 'm.unknown']) async {
-    await send('m.key.verification.cancel', {
-      'reason': code,
-      'code': code,
-    });
+  Future<void> cancel([String code = 'm.unknown', bool quiet = false]) async {
+    if (!quiet && (deviceId != null || room != null)) {
+      await send('m.key.verification.cancel', {
+        'reason': code,
+        'code': code,
+      });
+    }
     canceled = true;
     canceledCode = code;
     setState(KeyVerificationState.error);
@@ -536,9 +552,10 @@ class KeyVerification {
 
   Future<void> send(String type, Map<String, dynamic> payload) async {
     makePayload(payload);
-    print('[Key Verification] Sending type ${type}: ' + payload.toString());
+    Logs.info('[Key Verification] Sending type ${type}: ' + payload.toString());
     if (room != null) {
-      print('[Key Verification] Sending to ${userId} in room ${room.id}');
+      Logs.info(
+          '[Key Verification] Sending to ${userId} in room ${room.id}...');
       if (['m.key.verification.request'].contains(type)) {
         payload['msgtype'] = type;
         payload['to'] = userId;
@@ -552,8 +569,9 @@ class KeyVerification {
         encryption.keyVerificationManager.addRequest(this);
       }
     } else {
-      print('[Key Verification] Sending to ${userId} device ${deviceId}');
-      await client.sendToDevice(
+      Logs.info(
+          '[Key Verification] Sending to ${userId} device ${deviceId}...');
+      await client.sendToDeviceEncrypted(
           [client.userDeviceKeys[userId].deviceKeys[deviceId]], type, payload);
     }
   }
@@ -679,8 +697,8 @@ class _KeyVerificationMethodSas extends _KeyVerificationMethod {
           break;
       }
     } catch (err, stacktrace) {
-      print('[Key Verification SAS] An error occured: ' + err.toString());
-      print(stacktrace);
+      Logs.error('[Key Verification SAS] An error occured: ' + err.toString(),
+          stacktrace);
       if (request.deviceId != null) {
         await request.cancel('m.invalid_message');
       }

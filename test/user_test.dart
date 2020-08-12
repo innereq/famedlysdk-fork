@@ -27,7 +27,7 @@ import 'fake_matrix_api.dart';
 void main() {
   /// All Tests related to the Event
   group('User', () {
-    var client = Client('testclient', debug: true, httpClient: FakeMatrixApi());
+    var client = Client('testclient', httpClient: FakeMatrixApi());
     final user1 = User(
       '@alice:example.com',
       membership: 'join',
@@ -102,7 +102,7 @@ void main() {
     });
     test('startDirectChat', () async {
       await client.checkServer('https://fakeserver.notexisting');
-      await client.login('test', '1234');
+      await client.login(user: 'test', password: '1234');
       await user1.startDirectChat();
     });
     test('getPresence', () async {

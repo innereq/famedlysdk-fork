@@ -72,11 +72,15 @@ class Encryption {
   }
 
   Future<void> handleToDeviceEvent(ToDeviceEvent event) async {
-    if (['m.room_key', 'm.room_key_request', 'm.forwarded_room_key']
-        .contains(event.type)) {
-      // a new room key or thelike. We need to handle this asap, before other
+    if (event.type == 'm.room_key') {
+      // a new room key. We need to handle this asap, before other
       // events in /sync are handled
       await keyManager.handleToDeviceEvent(event);
+    }
+    if (['m.room_key_request', 'm.forwarded_room_key'].contains(event.type)) {
+      // "just" room key request things. We don't need these asap, so we handle
+      // them in the background
+      unawaited(keyManager.handleToDeviceEvent(event));
     }
     if (event.type.startsWith('m.key.verification.')) {
       // some key verification event. No need to handle it now, we can easily
@@ -263,6 +267,9 @@ class Encryption {
     if (sess == null) {
       throw ('Unable to create new outbound group session');
     }
+    // we clone the payload as we do not want to remove 'm.relates_to' from the
+    // original payload passed into this function
+    payload = Map<String, dynamic>.from(payload);
     final Map<String, dynamic> mRelatesTo = payload.remove('m.relates_to');
     final payloadContent = {
       'content': payload,

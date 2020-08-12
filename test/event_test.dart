@@ -50,7 +50,7 @@ void main() {
       'status': 2,
       'content': contentJson,
     };
-    var client = Client('testclient', debug: true, httpClient: FakeMatrixApi());
+    var client = Client('testclient', httpClient: FakeMatrixApi());
     var event = Event.fromJson(
         jsonObj, Room(id: '!localpart:server.abc', client: client));
 
@@ -67,7 +67,7 @@ void main() {
       expect(event.formattedText, formatted_body);
       expect(event.body, body);
       expect(event.type, EventTypes.Message);
-      expect(event.isReply, true);
+      expect(event.relationshipType, RelationshipTypes.Reply);
       jsonObj['state_key'] = '';
       var state = Event.fromJson(jsonObj, null);
       expect(state.eventId, id);
@@ -160,7 +160,43 @@ void main() {
         'event_id': '1234',
       };
       event = Event.fromJson(jsonObj, null);
-      expect(event.messageType, MessageTypes.Reply);
+      expect(event.messageType, MessageTypes.Text);
+      expect(event.relationshipType, RelationshipTypes.Reply);
+      expect(event.relationshipEventId, '1234');
+    });
+
+    test('relationship types', () async {
+      Event event;
+
+      jsonObj['content'] = <String, dynamic>{
+        'msgtype': 'm.text',
+        'text': 'beep',
+      };
+      event = Event.fromJson(jsonObj, null);
+      expect(event.relationshipType, null);
+      expect(event.relationshipEventId, null);
+
+      jsonObj['content']['m.relates_to'] = <String, dynamic>{
+        'rel_type': 'm.replace',
+        'event_id': 'abc',
+      };
+      event = Event.fromJson(jsonObj, null);
+      expect(event.relationshipType, RelationshipTypes.Edit);
+      expect(event.relationshipEventId, 'abc');
+
+      jsonObj['content']['m.relates_to']['rel_type'] = 'm.annotation';
+      event = Event.fromJson(jsonObj, null);
+      expect(event.relationshipType, RelationshipTypes.Reaction);
+      expect(event.relationshipEventId, 'abc');
+
+      jsonObj['content']['m.relates_to'] = {
+        'm.in_reply_to': {
+          'event_id': 'def',
+        },
+      };
+      event = Event.fromJson(jsonObj, null);
+      expect(event.relationshipType, RelationshipTypes.Reply);
+      expect(event.relationshipEventId, 'def');
     });
 
     test('redact', () async {
@@ -175,8 +211,7 @@ void main() {
       ];
       for (final testType in testTypes) {
         redactJsonObj['type'] = testType;
-        final room =
-            Room(id: '1234', client: Client('testclient', debug: true));
+        final room = Room(id: '1234', client: Client('testclient'));
         final redactionEventJson = {
           'content': {'reason': 'Spamming'},
           'event_id': '143273582443PhrSn:example.org',
@@ -200,7 +235,7 @@ void main() {
 
     test('remove', () async {
       var event = Event.fromJson(
-          jsonObj, Room(id: '1234', client: Client('testclient', debug: true)));
+          jsonObj, Room(id: '1234', client: Client('testclient')));
       final removed1 = await event.remove();
       event.status = 0;
       final removed2 = await event.remove();
@@ -209,10 +244,9 @@ void main() {
     });
 
     test('sendAgain', () async {
-      var matrix =
-          Client('testclient', debug: true, httpClient: FakeMatrixApi());
+      var matrix = Client('testclient', httpClient: FakeMatrixApi());
       await matrix.checkServer('https://fakeServer.notExisting');
-      await matrix.login('test', '1234');
+      await matrix.login(user: 'test', password: '1234');
 
       var event = Event.fromJson(
           jsonObj, Room(id: '!1234:example.com', client: matrix));
@@ -226,10 +260,9 @@ void main() {
     });
 
     test('requestKey', () async {
-      var matrix =
-          Client('testclient', debug: true, httpClient: FakeMatrixApi());
+      var matrix = Client('testclient', httpClient: FakeMatrixApi());
       await matrix.checkServer('https://fakeServer.notExisting');
-      await matrix.login('test', '1234');
+      await matrix.login(user: 'test', password: '1234');
 
       var event = Event.fromJson(
           jsonObj, Room(id: '!1234:example.com', client: matrix));
@@ -274,8 +307,7 @@ void main() {
       expect(event.canRedact, true);
     });
     test('getLocalizedBody', () async {
-      final matrix =
-          Client('testclient', debug: true, httpClient: FakeMatrixApi());
+      final matrix = Client('testclient', httpClient: FakeMatrixApi());
       final room = Room(id: '!1234:example.com', client: matrix);
       var event = Event.fromJson({
         'content': {
@@ -789,6 +821,144 @@ void main() {
         'unsigned': {'age': 1234}
       }, room);
       expect(event.getLocalizedBody(FakeMatrixLocalizations()), null);
+    });
+
+    test('aggregations', () {
+      var event = Event.fromJson({
+        'content': {
+          'body': 'blah',
+          'msgtype': 'm.text',
+        },
+        'event_id': '\$source',
+      }, null);
+      var edit1 = Event.fromJson({
+        'content': {
+          'body': 'blah',
+          'msgtype': 'm.text',
+          'm.relates_to': {
+            'event_id': '\$source',
+            'rel_type': RelationshipTypes.Edit,
+          },
+        },
+        'event_id': '\$edit1',
+      }, null);
+      var edit2 = Event.fromJson({
+        'content': {
+          'body': 'blah',
+          'msgtype': 'm.text',
+          'm.relates_to': {
+            'event_id': '\$source',
+            'rel_type': RelationshipTypes.Edit,
+          },
+        },
+        'event_id': '\$edit2',
+      }, null);
+      var room = Room(client: client);
+      var timeline = Timeline(events: <Event>[event, edit1, edit2], room: room);
+      expect(event.hasAggregatedEvents(timeline, RelationshipTypes.Edit), true);
+      expect(event.aggregatedEvents(timeline, RelationshipTypes.Edit),
+          {edit1, edit2});
+      expect(event.aggregatedEvents(timeline, RelationshipTypes.Reaction),
+          <Event>{});
+      expect(event.hasAggregatedEvents(timeline, RelationshipTypes.Reaction),
+          false);
+
+      timeline.removeAggregatedEvent(edit2);
+      expect(event.aggregatedEvents(timeline, RelationshipTypes.Edit), {edit1});
+      timeline.addAggregatedEvent(edit2);
+      expect(event.aggregatedEvents(timeline, RelationshipTypes.Edit),
+          {edit1, edit2});
+
+      timeline.removeAggregatedEvent(event);
+      expect(
+          event.aggregatedEvents(timeline, RelationshipTypes.Edit), <Event>{});
+    });
+    test('getDisplayEvent', () {
+      var event = Event.fromJson({
+        'type': EventTypes.Message,
+        'content': {
+          'body': 'blah',
+          'msgtype': 'm.text',
+        },
+        'event_id': '\$source',
+        'sender': '@alice:example.org',
+      }, null);
+      event.sortOrder = 0;
+      var edit1 = Event.fromJson({
+        'type': EventTypes.Message,
+        'content': {
+          'body': '* edit 1',
+          'msgtype': 'm.text',
+          'm.new_content': {
+            'body': 'edit 1',
+            'msgtype': 'm.text',
+          },
+          'm.relates_to': {
+            'event_id': '\$source',
+            'rel_type': RelationshipTypes.Edit,
+          },
+        },
+        'event_id': '\$edit1',
+        'sender': '@alice:example.org',
+      }, null);
+      edit1.sortOrder = 1;
+      var edit2 = Event.fromJson({
+        'type': EventTypes.Message,
+        'content': {
+          'body': '* edit 2',
+          'msgtype': 'm.text',
+          'm.new_content': {
+            'body': 'edit 2',
+            'msgtype': 'm.text',
+          },
+          'm.relates_to': {
+            'event_id': '\$source',
+            'rel_type': RelationshipTypes.Edit,
+          },
+        },
+        'event_id': '\$edit2',
+        'sender': '@alice:example.org',
+      }, null);
+      edit2.sortOrder = 2;
+      var edit3 = Event.fromJson({
+        'type': EventTypes.Message,
+        'content': {
+          'body': '* edit 3',
+          'msgtype': 'm.text',
+          'm.new_content': {
+            'body': 'edit 3',
+            'msgtype': 'm.text',
+          },
+          'm.relates_to': {
+            'event_id': '\$source',
+            'rel_type': RelationshipTypes.Edit,
+          },
+        },
+        'event_id': '\$edit3',
+        'sender': '@bob:example.org',
+      }, null);
+      edit3.sortOrder = 3;
+      var room = Room(client: client);
+      // no edits
+      var displayEvent =
+          event.getDisplayEvent(Timeline(events: <Event>[event], room: room));
+      expect(displayEvent.body, 'blah');
+      // one edit
+      displayEvent = event
+          .getDisplayEvent(Timeline(events: <Event>[event, edit1], room: room));
+      expect(displayEvent.body, 'edit 1');
+      // two edits
+      displayEvent = event.getDisplayEvent(
+          Timeline(events: <Event>[event, edit1, edit2], room: room));
+      expect(displayEvent.body, 'edit 2');
+      // foreign edit
+      displayEvent = event
+          .getDisplayEvent(Timeline(events: <Event>[event, edit3], room: room));
+      expect(displayEvent.body, 'blah');
+      // mixed foreign and non-foreign
+      displayEvent = event.getDisplayEvent(
+          Timeline(events: <Event>[event, edit1, edit2, edit3], room: room));
+      expect(displayEvent.body, 'edit 2');
     });
   });
 }

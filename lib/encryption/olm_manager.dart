@@ -18,6 +18,7 @@
 
 import 'dart:convert';
 
+import 'package:famedlysdk/src/utils/logs.dart';
 import 'package:pedantic/pedantic.dart';
 import 'package:canonical_json/canonical_json.dart';
 import 'package:famedlysdk/famedlysdk.dart';
@@ -119,9 +120,9 @@ class OlmManager {
     try {
       olmutil.ed25519_verify(key, message, signature);
       isValid = true;
-    } catch (e) {
+    } catch (e, s) {
       isValid = false;
-      print('[LibOlm] Signature check failed: ' + e.toString());
+      Logs.error('[LibOlm] Signature check failed: ' + e.toString(), s);
     } finally {
       olmutil.free();
     }
@@ -182,7 +183,7 @@ class OlmManager {
           signJson(keysContent['device_keys'] as Map<String, dynamic>);
     }
 
-    final response = await client.api.uploadDeviceKeys(
+    final response = await client.uploadDeviceKeys(
       deviceKeys: uploadDeviceKeys
           ? MatrixDeviceKeys.fromJson(keysContent['device_keys'])
           : null,
@@ -231,7 +232,7 @@ class OlmManager {
       return event;
     }
     if (event.content['algorithm'] != 'm.olm.v1.curve25519-aes-sha2') {
-      throw ('Unknown algorithm: ${event.content}');
+      throw ('Unknown algorithm: ${event.content['algorithm']}');
     }
     if (!event.content['ciphertext'].containsKey(identityKey)) {
       throw ("The message isn't sent for this device");
@@ -334,7 +335,7 @@ class OlmManager {
       return;
     }
     await startOutgoingOlmSessions([device]);
-    await client.sendToDevice([device], 'm.dummy', {});
+    await client.sendToDeviceEncrypted([device], 'm.dummy', {});
   }
 
   Future<ToDeviceEvent> decryptToDeviceEvent(ToDeviceEvent event) async {
@@ -382,7 +383,7 @@ class OlmManager {
     }
 
     final response =
-        await client.api.requestOneTimeKeys(requestingKeysFrom, timeout: 10000);
+        await client.requestOneTimeKeys(requestingKeysFrom, timeout: 10000);
 
     for (var userKeysEntry in response.oneTimeKeys.entries) {
       final userId = userKeysEntry.key;
@@ -408,10 +409,12 @@ class OlmManager {
               lastReceived:
                   DateTime.now(), // we want to use a newly created session
             ));
-          } catch (e) {
+          } catch (e, s) {
             session.free();
-            print('[LibOlm] Could not create new outbound olm session: ' +
-                e.toString());
+            Logs.error(
+                '[LibOlm] Could not create new outbound olm session: ' +
+                    e.toString(),
+                s);
           }
         }
       }
@@ -483,8 +486,9 @@ class OlmManager {
       try {
         data[device.userId][device.deviceId] =
             await encryptToDeviceMessagePayload(device, type, payload);
-      } catch (e) {
-        print('[LibOlm] Error encrypting to-device event: ' + e.toString());
+      } catch (e, s) {
+        Logs.error(
+            '[LibOlm] Error encrypting to-device event: ' + e.toString(), s);
         continue;
       }
     }

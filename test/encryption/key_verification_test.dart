@@ -20,6 +20,7 @@ import 'dart:convert';
 
 import 'package:famedlysdk/famedlysdk.dart';
 import 'package:famedlysdk/encryption.dart';
+import 'package:famedlysdk/src/utils/logs.dart';
 import 'package:test/test.dart';
 import 'package:olm/olm.dart' as olm;
 
@@ -67,9 +68,9 @@ void main() {
       olm.Account();
     } catch (_) {
       olmEnabled = false;
-      print('[LibOlm] Failed to load LibOlm: ' + _.toString());
+      Logs.warning('[LibOlm] Failed to load LibOlm: ' + _.toString());
     }
-    print('[LibOlm] Enabled: $olmEnabled');
+    Logs.success('[LibOlm] Enabled: $olmEnabled');
 
     if (!olmEnabled) return;
 
@@ -82,14 +83,13 @@ void main() {
 
     test('setupClient', () async {
       client1 = await getClient();
-      client2 =
-          Client('othertestclient', debug: true, httpClient: FakeMatrixApi());
+      client2 = Client('othertestclient', httpClient: FakeMatrixApi());
       client2.database = client1.database;
       await client2.checkServer('https://fakeServer.notExisting');
       client2.connect(
         newToken: 'abc',
         newUserID: '@othertest:fakeServer.notExisting',
-        newHomeserver: client2.api.homeserver,
+        newHomeserver: client2.homeserver,
         newDeviceName: 'Text Matrix Client',
         newDeviceID: 'FOXDEVICE',
         newOlmAccount: otherPickledOlmAccount,
