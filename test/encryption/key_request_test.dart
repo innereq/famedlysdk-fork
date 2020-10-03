@@ -18,6 +18,7 @@
 
 import 'dart:convert';
 import 'package:famedlysdk/famedlysdk.dart';
+import 'package:famedlysdk/src/utils/logs.dart';
 import 'package:test/test.dart';
 import 'package:olm/olm.dart' as olm;
 
@@ -45,14 +46,14 @@ void main() {
       olm.Account();
     } catch (_) {
       olmEnabled = false;
-      print('[LibOlm] Failed to load LibOlm: ' + _.toString());
+      Logs.warning('[LibOlm] Failed to load LibOlm: ' + _.toString());
     }
-    print('[LibOlm] Enabled: $olmEnabled');
+    Logs.success('[LibOlm] Enabled: $olmEnabled');
 
     if (!olmEnabled) return;
 
     final validSessionId = 'ciM/JWTPrmiWPPZNkRLDPQYf9AW/I46bxyLSr+Bx5oU';
-    final validSenderKey = '3C5BFWi2Y8MaVvjM8M22DBmh24PmgR0nPvJOIArzgyI';
+    final validSenderKey = 'JBG7ZaPn54OBC7TuIEiylW3BZ+7WcGQhFBPB9pogbAg';
     test('Create Request', () async {
       var matrix = await getClient();
       final requestRoom = matrix.getRoomById('!726s6s6q:example.com');
@@ -106,7 +107,7 @@ void main() {
             'requesting_device_id': 'OTHERDEVICE',
           });
       await matrix.encryption.keyManager.handleToDeviceEvent(event);
-      print(FakeMatrixApi.calledEndpoints.keys.toString());
+      Logs.info(FakeMatrixApi.calledEndpoints.keys.toString());
       expect(
           FakeMatrixApi.calledEndpoints.keys.any(
               (k) => k.startsWith('/client/r0/sendToDevice/m.room.encrypted')),

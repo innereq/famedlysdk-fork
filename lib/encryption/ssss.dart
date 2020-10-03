@@ -16,16 +16,19 @@
  *   along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-import 'dart:typed_data';
+import 'dart:core';
 import 'dart:convert';
+import 'dart:typed_data';
 
-import 'package:encrypt/encrypt.dart';
-import 'package:crypto/crypto.dart';
 import 'package:base58check/base58.dart';
+import 'package:crypto/crypto.dart';
+import 'package:encrypt/encrypt.dart';
 import 'package:password_hash/password_hash.dart';
-import 'package:famedlysdk/famedlysdk.dart';
-import 'package:famedlysdk/matrix_api.dart';
 
+import '../famedlysdk.dart';
+import '../matrix_api.dart';
+import '../src/database/database.dart';
+import '../src/utils/logs.dart';
 import 'encryption.dart';
 
 const CACHE_TYPES = <String>[
@@ -46,7 +49,14 @@ class SSSS {
   Client get client => encryption.client;
   final pendingShareRequests = <String, _ShareRequest>{};
   final _validators = <String, Future<bool> Function(String)>{};
+  final Map<String, DbSSSSCache> _cache = <String, DbSSSSCache>{};
   SSSS(this.encryption);
+
+  // for testing
+  Future<void> clearCache() async {
+    await client.database?.clearSSSSCache(client.id);
+    _cache.clear();
+  }
 
   static _DerivedKeys deriveKeys(Uint8List key, String name) {
     final zerosalt = Uint8List(8);
@@ -132,7 +142,7 @@ class SSSS {
     }
     final generator = PBKDF2(hashAlgorithm: sha512);
     return Uint8List.fromList(generator.generateKey(passphrase, info.salt,
-        info.iterations, info.bits != null ? info.bits / 8 : 32));
+        info.iterations, info.bits != null ? (info.bits / 8).ceil() : 32));
   }
 
   void setValidator(String type, Future<bool> Function(String) validator) {
@@ -171,16 +181,22 @@ class SSSS {
     if (client.database == null) {
       return null;
     }
+    // check if it is still valid
+    final keys = keyIdsFromType(type);
+    final isValid = (dbEntry) =>
+        keys.contains(dbEntry.keyId) &&
+        client.accountData[type].content['encrypted'][dbEntry.keyId]
+                ['ciphertext'] ==
+            dbEntry.ciphertext;
+    if (_cache.containsKey(type) && isValid(_cache[type])) {
+      return _cache[type].content;
+    }
     final ret = await client.database.getSSSSCache(client.id, type);
     if (ret == null) {
       return null;
     }
-    // check if it is still valid
-    final keys = keyIdsFromType(type);
-    if (keys.contains(ret.keyId) &&
-        client.accountData[type].content['encrypted'][ret.keyId]
-                ['ciphertext'] ==
-            ret.ciphertext) {
+    if (isValid(ret)) {
+      _cache[type] = ret;
       return ret.content;
     }
     return null;
@@ -221,7 +237,7 @@ class SSSS {
       'mac': encrypted.mac,
     };
     // store the thing in your account data
-    await client.api.setAccountData(client.userID, type, content);
+    await client.setAccountData(client.userID, type, content);
     if (CACHE_TYPES.contains(type) && client.database != null) {
       // cache the thing
       await client.database
@@ -242,25 +258,34 @@ class SSSS {
     }
   }
 
-  Future<void> maybeRequestAll(List<DeviceKeys> devices) async {
+  Future<void> maybeRequestAll([List<DeviceKeys> devices]) async {
     for (final type in CACHE_TYPES) {
-      final secret = await getCached(type);
-      if (secret == null) {
-        await request(type, devices);
+      if (keyIdsFromType(type) != null) {
+        final secret = await getCached(type);
+        if (secret == null) {
+          await request(type, devices);
+        }
       }
     }
   }
 
-  Future<void> request(String type, List<DeviceKeys> devices) async {
+  Future<void> request(String type, [List<DeviceKeys> devices]) async {
     // only send to own, verified devices
-    print('[SSSS] Requesting type ${type}...');
+    Logs.info('[SSSS] Requesting type ${type}...');
+    if (devices == null || devices.isEmpty) {
+      if (!client.userDeviceKeys.containsKey(client.userID)) {
+        Logs.warning('[SSSS] User does not have any devices');
+        return;
+      }
+      devices = client.userDeviceKeys[client.userID].deviceKeys.values.toList();
+    }
     devices.removeWhere((DeviceKeys d) =>
         d.userId != client.userID ||
         !d.verified ||
         d.blocked ||
         d.deviceId == client.deviceID);
     if (devices.isEmpty) {
-      print('[SSSS] Warn: No devices');
+      Logs.warning('[SSSS] No devices');
       return;
     }
     final requestId = client.generateUniqueTransactionId();
@@ -270,7 +295,7 @@ class SSSS {
       devices: devices,
     );
     pendingShareRequests[requestId] = request;
-    await client.sendToDevice(devices, 'm.secret.request', {
+    await client.sendToDeviceEncrypted(devices, 'm.secret.request', {
       'action': 'request',
       'requesting_device_id': client.deviceID,
       'request_id': requestId,
@@ -278,35 +303,57 @@ class SSSS {
     });
   }
 
+  DateTime _lastCacheRequest;
+  bool _isPeriodicallyRequestingMissingCache = false;
+  Future<void> periodicallyRequestMissingCache() async {
+    if (_isPeriodicallyRequestingMissingCache ||
+        (_lastCacheRequest != null &&
+            DateTime.now()
+                .subtract(Duration(minutes: 15))
+                .isBefore(_lastCacheRequest)) ||
+        client.isUnknownSession) {
+      // we are already requesting right now or we attempted to within the last 15 min
+      return;
+    }
+    _lastCacheRequest = DateTime.now();
+    _isPeriodicallyRequestingMissingCache = true;
+    try {
+      await maybeRequestAll();
+    } finally {
+      _isPeriodicallyRequestingMissingCache = false;
+    }
+  }
+
   Future<void> handleToDeviceEvent(ToDeviceEvent event) async {
     if (event.type == 'm.secret.request') {
       // got a request to share a secret
-      print('[SSSS] Received sharing request...');
+      Logs.info('[SSSS] Received sharing request...');
       if (event.sender != client.userID ||
           !client.userDeviceKeys.containsKey(client.userID)) {
-        print('[SSSS] Not sent by us');
+        Logs.info('[SSSS] Not sent by us');
         return; // we aren't asking for it ourselves, so ignore
       }
       if (event.content['action'] != 'request') {
-        print('[SSSS] it is actually a cancelation');
+        Logs.info('[SSSS] it is actually a cancelation');
         return; // not actually requesting, so ignore
       }
       final device = client.userDeviceKeys[client.userID]
           .deviceKeys[event.content['requesting_device_id']];
       if (device == null || !device.verified || device.blocked) {
-        print('[SSSS] Unknown / unverified devices, ignoring');
+        Logs.info('[SSSS] Unknown / unverified devices, ignoring');
         return; // nope....unknown or untrusted device
       }
       // alright, all seems fine...let's check if we actually have the secret they are asking for
       final type = event.content['name'];
       final secret = await getCached(type);
       if (secret == null) {
-        print('[SSSS] We don\'t have the secret for ${type} ourself, ignoring');
+        Logs.info(
+            '[SSSS] We don\'t have the secret for ${type} ourself, ignoring');
         return; // seems like we don't have this, either
       }
       // okay, all checks out...time to share this secret!
-      print('[SSSS] Replying with secret for ${type}');
-      await client.sendToDevice(
+      Logs.info('[SSSS] Replying with secret for ${type}');
+      await client.sendToDeviceEncrypted(
           [device],
           'm.secret.send',
           {
@@ -315,11 +362,11 @@ class SSSS {
           });
     } else if (event.type == 'm.secret.send') {
       // receiving a secret we asked for
-      print('[SSSS] Received shared secret...');
+      Logs.info('[SSSS] Received shared secret...');
       if (event.sender != client.userID ||
           !pendingShareRequests.containsKey(event.content['request_id']) ||
           event.encryptedContent == null) {
-        print('[SSSS] Not by us or unknown request');
+        Logs.info('[SSSS] Not by us or unknown request');
         return; // we have no idea what we just received
       }
       final request = pendingShareRequests[event.content['request_id']];
@@ -330,26 +377,26 @@ class SSSS {
               d.curve25519Key == event.encryptedContent['sender_key'],
           orElse: () => null);
       if (device == null) {
-        print('[SSSS] Someone else replied?');
+        Logs.info('[SSSS] Someone else replied?');
         return; // someone replied whom we didn't send the share request to
       }
       final secret = event.content['secret'];
       if (!(event.content['secret'] is String)) {
-        print('[SSSS] Secret wasn\'t a string');
+        Logs.info('[SSSS] Secret wasn\'t a string');
         return; // the secret wasn't a string....wut?
       }
       // let's validate if the secret is, well, valid
       if (_validators.containsKey(request.type) &&
           !(await _validators[request.type](secret))) {
-        print('[SSSS] The received secret was invalid');
+        Logs.info('[SSSS] The received secret was invalid');
         return; // didn't pass the validator
       }
       pendingShareRequests.remove(request.requestId);
       if (request.start.add(Duration(minutes: 15)).isBefore(DateTime.now())) {
-        print('[SSSS] Request is too far in the past');
+        Logs.info('[SSSS] Request is too far in the past');
         return; // our request is more than 15min in the past...better not trust it anymore
       }
-      print('[SSSS] Secret for type ${request.type} is ok, storing it');
+      Logs.info('[SSSS] Secret for type ${request.type} is ok, storing it');
       if (client.database != null) {
         final keyId = keyIdFromType(request.type);
         if (keyId != null) {

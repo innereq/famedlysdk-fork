@@ -20,6 +20,7 @@ import 'dart:convert';
 
 import 'package:famedlysdk/famedlysdk.dart';
 import 'package:famedlysdk/encryption.dart';
+import 'package:famedlysdk/src/utils/logs.dart';
 import 'package:test/test.dart';
 import 'package:olm/olm.dart' as olm;
 
@@ -31,7 +32,7 @@ class MockSSSS extends SSSS {
 
   bool requestedSecrets = false;
   @override
-  Future<void> maybeRequestAll(List<DeviceKeys> devices) async {
+  Future<void> maybeRequestAll([List<DeviceKeys> devices]) async {
     requestedSecrets = true;
     final handle = open();
     handle.unlock(recoveryKey: SSSS_KEY);
@@ -67,9 +68,9 @@ void main() {
       olm.Account();
     } catch (_) {
       olmEnabled = false;
-      print('[LibOlm] Failed to load LibOlm: ' + _.toString());
+      Logs.warning('[LibOlm] Failed to load LibOlm: ' + _.toString());
     }
-    print('[LibOlm] Enabled: $olmEnabled');
+    Logs.success('[LibOlm] Enabled: $olmEnabled');
 
     if (!olmEnabled) return;
 
@@ -82,14 +83,13 @@ void main() {
 
     test('setupClient', () async {
       client1 = await getClient();
-      client2 =
-          Client('othertestclient', debug: true, httpClient: FakeMatrixApi());
+      client2 = Client('othertestclient', httpClient: FakeMatrixApi());
       client2.database = client1.database;
       await client2.checkServer('https://fakeServer.notExisting');
       client2.connect(
         newToken: 'abc',
         newUserID: '@othertest:fakeServer.notExisting',
-        newHomeserver: client2.api.homeserver,
+        newHomeserver: client2.homeserver,
         newDeviceName: 'Text Matrix Client',
         newDeviceID: 'FOXDEVICE',
         newOlmAccount: otherPickledOlmAccount,
@@ -207,7 +207,7 @@ void main() {
 
     test('ask SSSS start', () async {
       client1.userDeviceKeys[client1.userID].masterKey.setDirectVerified(true);
-      await client1.database.clearSSSSCache(client1.id);
+      await client1.encryption.ssss.clearCache();
       final req1 =
           await client1.userDeviceKeys[client2.userID].startVerification();
       expect(req1.state, KeyVerificationState.askSSSS);
@@ -288,7 +288,7 @@ void main() {
 
       // alright, they match
       client1.userDeviceKeys[client1.userID].masterKey.setDirectVerified(true);
-      await client1.database.clearSSSSCache(client1.id);
+      await client1.encryption.ssss.clearCache();
 
       // send mac
       FakeMatrixApi.calledEndpoints.clear();
@@ -312,7 +312,7 @@ void main() {
 
       client1.encryption.ssss = MockSSSS(client1.encryption);
       (client1.encryption.ssss as MockSSSS).requestedSecrets = false;
-      await client1.database.clearSSSSCache(client1.id);
+      await client1.encryption.ssss.clearCache();
       await req1.maybeRequestSSSSSecrets();
       await Future.delayed(Duration(milliseconds: 10));
       expect((client1.encryption.ssss as MockSSSS).requestedSecrets, true);

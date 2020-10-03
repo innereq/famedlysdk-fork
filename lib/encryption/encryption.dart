@@ -17,14 +17,18 @@
  */
 
 import 'dart:convert';
+import 'dart:async';
 
-import 'package:famedlysdk/famedlysdk.dart';
-import 'package:famedlysdk/matrix_api.dart';
 import 'package:pedantic/pedantic.dart';
-import 'key_manager.dart';
-import 'olm_manager.dart';
-import 'key_verification_manager.dart';
+
+import '../famedlysdk.dart';
+import '../matrix_api.dart';
+import '../src/utils/run_in_root.dart';
+import '../src/utils/logs.dart';
 import 'cross_signing.dart';
+import 'key_manager.dart';
+import 'key_verification_manager.dart';
+import 'olm_manager.dart';
 import 'ssss.dart';
 
 class Encryption {
@@ -61,10 +65,12 @@ class Encryption {
 
   Future<void> init(String olmAccount) async {
     await olmManager.init(olmAccount);
+    _backgroundTasksRunning = true;
+    _backgroundTasks(); // start the background tasks
   }
 
   void handleDeviceOneTimeKeysCount(Map<String, int> countJson) {
-    olmManager.handleDeviceOneTimeKeysCount(countJson);
+    runInRoot(() => olmManager.handleDeviceOneTimeKeysCount(countJson));
   }
 
   void onSync() {
@@ -72,20 +78,29 @@ class Encryption {
   }
 
   Future<void> handleToDeviceEvent(ToDeviceEvent event) async {
-    if (['m.room_key', 'm.room_key_request', 'm.forwarded_room_key']
-        .contains(event.type)) {
-      // a new room key or thelike. We need to handle this asap, before other
+    if (event.type == 'm.room_key') {
+      // a new room key. We need to handle this asap, before other
       // events in /sync are handled
       await keyManager.handleToDeviceEvent(event);
+    }
+    if (['m.room_key_request', 'm.forwarded_room_key'].contains(event.type)) {
+      // "just" room key request things. We don't need these asap, so we handle
+      // them in the background
+      unawaited(runInRoot(() => keyManager.handleToDeviceEvent(event)));
     }
     if (event.type.startsWith('m.key.verification.')) {
       // some key verification event. No need to handle it now, we can easily
       // do this in the background
-      unawaited(keyVerificationManager.handleToDeviceEvent(event));
+      unawaited(
+          runInRoot(() => keyVerificationManager.handleToDeviceEvent(event)));
     }
     if (event.type.startsWith('m.secret.')) {
       // some ssss thing. We can do this in the background
-      unawaited(ssss.handleToDeviceEvent(event));
+      unawaited(runInRoot(() => ssss.handleToDeviceEvent(event)));
+    }
+    if (event.sender == client.userID) {
+      // maybe we need to re-try SSSS secrets
+      unawaited(runInRoot(() => ssss.periodicallyRequestMissingCache()));
     }
   }
 
@@ -99,7 +114,13 @@ class Encryption {
             update.content['content']['msgtype']
                 .startsWith('m.key.verification.'))) {
       // "just" key verification, no need to do this in sync
-      unawaited(keyVerificationManager.handleEventUpdate(update));
+      unawaited(
+          runInRoot(() => keyVerificationManager.handleEventUpdate(update)));
+    }
+    if (update.content['sender'] == client.userID &&
+        !update.content['unsigned'].containsKey('transaction_id')) {
+      // maybe we need to re-try SSSS secrets
+      unawaited(runInRoot(() => ssss.periodicallyRequestMissingCache()));
     }
   }
 
@@ -129,17 +150,28 @@ class Encryption {
       final decryptResult = inboundGroupSession.inboundGroupSession
           .decrypt(event.content['ciphertext']);
       canRequestSession = false;
-      final messageIndexKey = event.eventId +
+      // we can't have the key be an int, else json-serializing will fail, thus we need it to be a string
+      final messageIndexKey = 'key-' + decryptResult.message_index.toString();
+      final messageIndexValue = event.eventId +
+          '|' +
           event.originServerTs.millisecondsSinceEpoch.toString();
       var haveIndex = inboundGroupSession.indexes.containsKey(messageIndexKey);
       if (haveIndex &&
-          inboundGroupSession.indexes[messageIndexKey] !=
-              decryptResult.message_index) {
+          inboundGroupSession.indexes[messageIndexKey] != messageIndexValue) {
         // TODO: maybe clear outbound session, if it is ours
+        // TODO: Make it so that we can't re-request the session keys, this is just for debugging
+        Logs.error('[Decrypt] Could not decrypt due to a corrupted session.');
+        Logs.error('[Decrypt] Want session: $roomId $sessionId $senderKey');
+        Logs.error(
+            '[Decrypt] Have sessoin: ${inboundGroupSession.roomId} ${inboundGroupSession.sessionId} ${inboundGroupSession.senderKey}');
+        Logs.error(
+            '[Decrypt] Want indexes: $messageIndexKey $messageIndexValue');
+        Logs.error(
+            '[Decrypt] Have indexes: $messageIndexKey ${inboundGroupSession.indexes[messageIndexKey]}');
+        canRequestSession = true;
         throw (DecryptError.CHANNEL_CORRUPTED);
       }
-      inboundGroupSession.indexes[messageIndexKey] =
-          decryptResult.message_index;
+      inboundGroupSession.indexes[messageIndexKey] = messageIndexValue;
       if (!haveIndex) {
         // now we persist the udpated indexes into the database.
         // the entry should always exist. In the case it doesn't, the following
@@ -263,6 +295,9 @@ class Encryption {
     if (sess == null) {
       throw ('Unable to create new outbound group session');
     }
+    // we clone the payload as we do not want to remove 'm.relates_to' from the
+    // original payload passed into this function
+    payload = Map<String, dynamic>.from(payload);
     final Map<String, dynamic> mRelatesTo = payload.remove('m.relates_to');
     final payloadContent = {
       'content': payload,
@@ -296,10 +331,41 @@ class Encryption {
     return await olmManager.encryptToDeviceMessage(deviceKeys, type, payload);
   }
 
+  Future<void> autovalidateMasterOwnKey() async {
+    // check if we can set our own master key as verified, if it isn't yet
+    if (client.database != null &&
+        client.userDeviceKeys.containsKey(client.userID)) {
+      final masterKey = client.userDeviceKeys[client.userID].masterKey;
+      if (masterKey != null &&
+          !masterKey.directVerified &&
+          masterKey
+              .hasValidSignatureChain(onlyValidateUserIds: {client.userID})) {
+        await masterKey.setVerified(true);
+      }
+    }
+  }
+
+  // this method is responsible for all background tasks, such as uploading online key backups
+  bool _backgroundTasksRunning = true;
+  void _backgroundTasks() {
+    if (!_backgroundTasksRunning) {
+      return;
+    }
+
+    keyManager.backgroundTasks();
+
+    autovalidateMasterOwnKey();
+
+    if (_backgroundTasksRunning) {
+      Timer(Duration(seconds: 10), _backgroundTasks);
+    }
+  }
+
   void dispose() {
     keyManager.dispose();
     olmManager.dispose();
     keyVerificationManager.dispose();
+    _backgroundTasksRunning = false;
   }
 }
 

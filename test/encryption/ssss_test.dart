@@ -22,12 +22,26 @@ import 'dart:convert';
 import 'package:famedlysdk/famedlysdk.dart';
 import 'package:famedlysdk/matrix_api.dart';
 import 'package:famedlysdk/encryption.dart';
+import 'package:famedlysdk/src/utils/logs.dart';
 import 'package:test/test.dart';
 import 'package:encrypt/encrypt.dart';
 import 'package:olm/olm.dart' as olm;
 
 import '../fake_client.dart';
 import '../fake_matrix_api.dart';
+
+class MockSSSS extends SSSS {
+  MockSSSS(Encryption encryption) : super(encryption);
+
+  bool requestedSecrets = false;
+  @override
+  Future<void> maybeRequestAll([List<DeviceKeys> devices]) async {
+    requestedSecrets = true;
+    final handle = open();
+    handle.unlock(recoveryKey: SSSS_KEY);
+    await handle.maybeCacheAll();
+  }
+}
 
 void main() {
   group('SSSS', () {
@@ -37,9 +51,9 @@ void main() {
       olm.Account();
     } catch (_) {
       olmEnabled = false;
-      print('[LibOlm] Failed to load LibOlm: ' + _.toString());
+      Logs.warning('[LibOlm] Failed to load LibOlm: ' + _.toString());
     }
-    print('[LibOlm] Enabled: $olmEnabled');
+    Logs.success('[LibOlm] Enabled: $olmEnabled');
 
     if (!olmEnabled) return;
 
@@ -89,7 +103,7 @@ void main() {
       // account_data for this test
       final content = FakeMatrixApi
           .calledEndpoints[
-              '/client/r0/user/%40test%3AfakeServer.notExisting/account_data/best+animal']
+              '/client/r0/user/%40test%3AfakeServer.notExisting/account_data/best%20animal']
           .first;
       client.accountData['best animal'] = BasicEvent.fromJson({
         'type': 'best animal',
@@ -247,7 +261,7 @@ void main() {
           client.encryption.ssss.open('m.cross_signing.self_signing');
       handle.unlock(recoveryKey: SSSS_KEY);
 
-      await client.database.clearSSSSCache(client.id);
+      await client.encryption.ssss.clearCache();
       client.encryption.ssss.pendingShareRequests.clear();
       await client.encryption.ssss.request('best animal', [key]);
       var event = ToDeviceEvent(
@@ -271,7 +285,7 @@ void main() {
         'm.megolm_backup.v1'
       ]) {
         final secret = await handle.getStored(type);
-        await client.database.clearSSSSCache(client.id);
+        await client.encryption.ssss.clearCache();
         client.encryption.ssss.pendingShareRequests.clear();
         await client.encryption.ssss.request(type, [key]);
         event = ToDeviceEvent(
@@ -293,7 +307,7 @@ void main() {
       // test different fail scenarios
 
       // not encrypted
-      await client.database.clearSSSSCache(client.id);
+      await client.encryption.ssss.clearCache();
       client.encryption.ssss.pendingShareRequests.clear();
       await client.encryption.ssss.request('best animal', [key]);
       event = ToDeviceEvent(
@@ -308,7 +322,7 @@ void main() {
       expect(await client.encryption.ssss.getCached('best animal'), null);
 
       // unknown request id
-      await client.database.clearSSSSCache(client.id);
+      await client.encryption.ssss.clearCache();
       client.encryption.ssss.pendingShareRequests.clear();
       await client.encryption.ssss.request('best animal', [key]);
       event = ToDeviceEvent(
@@ -326,7 +340,7 @@ void main() {
       expect(await client.encryption.ssss.getCached('best animal'), null);
 
       // not from a device we sent the request to
-      await client.database.clearSSSSCache(client.id);
+      await client.encryption.ssss.clearCache();
       client.encryption.ssss.pendingShareRequests.clear();
       await client.encryption.ssss.request('best animal', [key]);
       event = ToDeviceEvent(
@@ -344,7 +358,7 @@ void main() {
       expect(await client.encryption.ssss.getCached('best animal'), null);
 
       // secret not a string
-      await client.database.clearSSSSCache(client.id);
+      await client.encryption.ssss.clearCache();
       client.encryption.ssss.pendingShareRequests.clear();
       await client.encryption.ssss.request('best animal', [key]);
       event = ToDeviceEvent(
@@ -362,7 +376,7 @@ void main() {
       expect(await client.encryption.ssss.getCached('best animal'), null);
 
       // validator doesn't check out
-      await client.database.clearSSSSCache(client.id);
+      await client.encryption.ssss.clearCache();
       client.encryption.ssss.pendingShareRequests.clear();
       await client.encryption.ssss.request('m.megolm_backup.v1', [key]);
       event = ToDeviceEvent(
@@ -385,10 +399,22 @@ void main() {
       final key =
           client.userDeviceKeys[client.userID].deviceKeys['OTHERDEVICE'];
       key.setDirectVerified(true);
-      await client.database.clearSSSSCache(client.id);
+      await client.encryption.ssss.clearCache();
       client.encryption.ssss.pendingShareRequests.clear();
       await client.encryption.ssss.maybeRequestAll([key]);
       expect(client.encryption.ssss.pendingShareRequests.length, 3);
+    });
+
+    test('periodicallyRequestMissingCache', () async {
+      client.userDeviceKeys[client.userID].masterKey.setDirectVerified(true);
+      client.encryption.ssss = MockSSSS(client.encryption);
+      (client.encryption.ssss as MockSSSS).requestedSecrets = false;
+      await client.encryption.ssss.periodicallyRequestMissingCache();
+      expect((client.encryption.ssss as MockSSSS).requestedSecrets, true);
+      // it should only retry once every 15 min
+      (client.encryption.ssss as MockSSSS).requestedSecrets = false;
+      await client.encryption.ssss.periodicallyRequestMissingCache();
+      expect((client.encryption.ssss as MockSSSS).requestedSecrets, false);
     });
 
     test('dispose client', () async {

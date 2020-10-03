@@ -18,8 +18,10 @@
 
 import 'dart:convert';
 import 'package:famedlysdk/famedlysdk.dart';
+import 'package:famedlysdk/src/utils/logs.dart';
 import 'package:test/test.dart';
 import 'package:olm/olm.dart' as olm;
+import 'package:famedlysdk/encryption/utils/json_signature_check_extension.dart';
 
 import '../fake_client.dart';
 import '../fake_matrix_api.dart';
@@ -32,9 +34,9 @@ void main() {
       olm.Account();
     } catch (_) {
       olmEnabled = false;
-      print('[LibOlm] Failed to load LibOlm: ' + _.toString());
+      Logs.warning('[LibOlm] Failed to load LibOlm: ' + _.toString());
     }
-    print('[LibOlm] Enabled: $olmEnabled');
+    Logs.success('[LibOlm] Enabled: $olmEnabled');
 
     if (!olmEnabled) return;
 
@@ -50,13 +52,9 @@ void main() {
       };
       final signedPayload = client.encryption.olmManager.signJson(payload);
       expect(
-          client.encryption.olmManager.checkJsonSignature(client.fingerprintKey,
-              signedPayload, client.userID, client.deviceID),
+          signedPayload.checkJsonSignature(
+              client.fingerprintKey, client.userID, client.deviceID),
           true);
-      expect(
-          client.encryption.olmManager.checkJsonSignature(
-              client.fingerprintKey, payload, client.userID, client.deviceID),
-          false);
     });
 
     test('uploadKeys', () async {

@@ -1,6 +1,6 @@
 /*
  *   Famedly Matrix SDK
- *   Copyright (C) 2019, 2020 Famedly GmbH
+ *   Copyright (C) 2020 Famedly GmbH
  *
  *   This program is free software: you can redistribute it and/or modify
  *   it under the terms of the GNU Affero General Public License as
@@ -16,24 +16,15 @@
  *   along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-import 'basic_event_with_sender.dart';
+import 'package:isolate/isolate.dart';
+import 'dart:async';
 
-class StrippedStateEvent extends BasicEventWithSender {
-  String stateKey;
-
-  StrippedStateEvent();
-  StrippedStateEvent.fromJson(Map<String, dynamic> json) {
-    final basicEvent = BasicEventWithSender.fromJson(json);
-    content = basicEvent.content;
-    type = basicEvent.type;
-    senderId = basicEvent.senderId;
-    stateKey = json['state_key'];
-  }
-
-  @override
-  Map<String, dynamic> toJson() {
-    final data = super.toJson();
-    data['state_key'] = stateKey;
-    return data;
+Future<T> runInBackground<T, U>(
+    FutureOr<T> Function(U arg) function, U arg) async {
+  final isolate = await IsolateRunner.spawn();
+  try {
+    return await isolate.run(function, arg);
+  } finally {
+    await isolate.close();
   }
 }

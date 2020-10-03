@@ -18,15 +18,23 @@
 
 import 'dart:convert';
 import 'dart:typed_data';
-import 'package:famedlysdk/famedlysdk.dart';
-import 'package:famedlysdk/encryption.dart';
-import 'package:famedlysdk/src/utils/receipt.dart';
+
 import 'package:http/http.dart' as http;
 import 'package:matrix_file_e2ee/matrix_file_e2ee.dart';
+
+import '../encryption.dart';
+import '../famedlysdk.dart';
 import '../matrix_api.dart';
-import './room.dart';
+import 'database/database.dart' show DbRoomState, DbEvent;
+import 'room.dart';
 import 'utils/matrix_localizations.dart';
-import './database/database.dart' show DbRoomState, DbEvent;
+import 'utils/receipt.dart';
+
+abstract class RelationshipTypes {
+  static const String Reply = 'm.in_reply_to';
+  static const String Edit = 'm.replace';
+  static const String Reaction = 'm.annotation';
+}
 
 /// All data exchanged over Matrix is expressed as an "event". Typically each client action (e.g. sending a message) correlates with exactly one event.
 class Event extends MatrixEvent {
@@ -90,12 +98,20 @@ class Event extends MatrixEvent {
     this.senderId = senderId;
     this.unsigned = unsigned;
     // synapse unfortunatley isn't following the spec and tosses the prev_content
-    // into the unsigned block
-    this.prevContent = prevContent != null && prevContent.isNotEmpty
-        ? prevContent
-        : (unsigned != null && unsigned['prev_content'] is Map
-            ? unsigned['prev_content']
-            : null);
+    // into the unsigned block.
+    // Currently we are facing a very strange bug in web which is impossible to debug.
+    // It may be because of this line so we put this in try-catch until we can fix it.
+    try {
+      this.prevContent = (prevContent != null && prevContent.isNotEmpty)
+          ? prevContent
+          : (unsigned != null &&
+                  unsigned.containsKey('prev_content') &&
+                  unsigned['prev_content'] is Map)
+              ? unsigned['prev_content']
+              : null;
+    } catch (_) {
+      // A strange bug in dart web makes this crash
+    }
     this.stateKey = stateKey;
     this.originServerTs = originServerTs;
   }
@@ -140,7 +156,9 @@ class Event extends MatrixEvent {
     final unsigned = Event.getMapFromPayload(jsonPayload['unsigned']);
     final prevContent = Event.getMapFromPayload(jsonPayload['prev_content']);
     return Event(
-      status: jsonPayload['status'] ?? defaultStatus,
+      status: jsonPayload['status'] ??
+          unsigned[MessageSendingStatusKey] ??
+          defaultStatus,
       stateKey: jsonPayload['state_key'],
       prevContent: prevContent,
       content: content,
@@ -212,9 +230,8 @@ class Event extends MatrixEvent {
       unsigned: unsigned,
       room: room);
 
-  String get messageType => (content['m.relates_to'] is Map &&
-          content['m.relates_to']['m.in_reply_to'] != null)
-      ? MessageTypes.Reply
+  String get messageType => type == EventTypes.Sticker
+      ? MessageTypes.Sticker
       : content['msgtype'] ?? MessageTypes.Text;
 
   void setRedactionEvent(Event redactedBecause) {
@@ -312,12 +329,13 @@ class Event extends MatrixEvent {
   /// Try to send this event again. Only works with events of status -1.
   Future<String> sendAgain({String txid}) async {
     if (status != -1) return null;
-    await remove();
-    final eventID = await room.sendEvent(
+    // we do not remove the event here. It will automatically be updated
+    // in the `sendEvent` method to transition -1 -> 0 -> 1 -> 2
+    final newEventId = await room.sendEvent(
       content,
-      txid: txid ?? unsigned['transaction_id'],
+      txid: txid ?? unsigned['transaction_id'] ?? eventId,
     );
-    return eventID;
+    return newEventId;
   }
 
   /// Whether the client is allowed to redact this event.
@@ -327,20 +345,10 @@ class Event extends MatrixEvent {
   Future<dynamic> redact({String reason, String txid}) =>
       room.redactEvent(eventId, reason: reason, txid: txid);
 
-  /// Whether this event is in reply to another event.
-  bool get isReply =>
-      content['m.relates_to'] is Map<String, dynamic> &&
-      content['m.relates_to']['m.in_reply_to'] is Map<String, dynamic> &&
-      content['m.relates_to']['m.in_reply_to']['event_id'] is String &&
-      (content['m.relates_to']['m.in_reply_to']['event_id'] as String)
-          .isNotEmpty;
-
   /// Searches for the reply event in the given timeline.
   Future<Event> getReplyEvent(Timeline timeline) async {
-    if (!isReply) return null;
-    final String replyEventId =
-        content['m.relates_to']['m.in_reply_to']['event_id'];
-    return await timeline.getEventById(replyEventId);
+    if (relationshipType != RelationshipTypes.Reply) return null;
+    return await timeline.getEventById(relationshipEventId);
   }
 
   /// If this event is encrypted and the decryption was not successful because
@@ -367,7 +375,8 @@ class Event extends MatrixEvent {
   /// contain an attachment, this throws an error. Set [getThumbnail] to
   /// true to download the thumbnail instead.
   Future<MatrixFile> downloadAndDecryptAttachment(
-      {bool getThumbnail = false}) async {
+      {bool getThumbnail = false,
+      Future<Uint8List> Function(String) downloadCallback}) async {
     if (![EventTypes.Message, EventTypes.Sticker].contains(type)) {
       throw ("This event has the type '$type' and so it can't contain an attachment.");
     }
@@ -397,7 +406,7 @@ class Event extends MatrixEvent {
     // Is this file storeable?
     final infoMap =
         getThumbnail ? content['info']['thumbnail_info'] : content['info'];
-    final storeable = room.client.database != null &&
+    var storeable = room.client.database != null &&
         infoMap is Map<String, dynamic> &&
         infoMap['size'] is int &&
         infoMap['size'] <= room.client.database.maxFileSize;
@@ -408,8 +417,13 @@ class Event extends MatrixEvent {
 
     // Download the file
     if (uint8list == null) {
+      downloadCallback ??= (String url) async {
+        return (await http.get(url)).bodyBytes;
+      };
       uint8list =
-          (await http.get(mxContent.getDownloadLink(room.client))).bodyBytes;
+          await downloadCallback(mxContent.getDownloadLink(room.client));
+      storeable = storeable &&
+          uint8list.lengthInBytes < room.client.database.maxFileSize;
       if (storeable) {
         await room.client.database
             .storeFile(mxContent.toString(), uint8list, DateTime.now());
@@ -480,9 +494,8 @@ class Event extends MatrixEvent {
         final targetName = stateKeyUser.calcDisplayname();
         // Has the membership changed?
         final newMembership = content['membership'] ?? '';
-        final oldMembership = unsigned['prev_content'] is Map<String, dynamic>
-            ? unsigned['prev_content']['membership'] ?? ''
-            : '';
+        final oldMembership =
+            prevContent != null ? prevContent['membership'] ?? '' : '';
         if (newMembership != oldMembership) {
           if (oldMembership == 'invite' && newMembership == 'join') {
             text = i18n.acceptedTheInvitation(targetName);
@@ -517,15 +530,12 @@ class Event extends MatrixEvent {
           }
         } else if (newMembership == 'join') {
           final newAvatar = content['avatar_url'] ?? '';
-          final oldAvatar = unsigned['prev_content'] is Map<String, dynamic>
-              ? unsigned['prev_content']['avatar_url'] ?? ''
-              : '';
+          final oldAvatar =
+              prevContent != null ? prevContent['avatar_url'] ?? '' : '';
 
           final newDisplayname = content['displayname'] ?? '';
           final oldDisplayname =
-              unsigned['prev_content'] is Map<String, dynamic>
-                  ? unsigned['prev_content']['displayname'] ?? ''
-                  : '';
+              prevContent != null ? prevContent['displayname'] ?? '' : '';
 
           // Has the user avatar changed?
           if (newAvatar != oldAvatar) {
@@ -583,6 +593,18 @@ class Event extends MatrixEvent {
           localizedBody += '. ' + i18n.needPantalaimonWarning;
         }
         break;
+      case EventTypes.CallAnswer:
+        localizedBody = i18n.answeredTheCall(senderName);
+        break;
+      case EventTypes.CallHangup:
+        localizedBody = i18n.endedTheCall(senderName);
+        break;
+      case EventTypes.CallInvite:
+        localizedBody = i18n.startedACall(senderName);
+        break;
+      case EventTypes.CallCandidates:
+        localizedBody = i18n.sentCallInformations(senderName);
+        break;
       case EventTypes.Encrypted:
       case EventTypes.Message:
         switch (messageType) {
@@ -631,7 +653,6 @@ class Event extends MatrixEvent {
           case MessageTypes.Text:
           case MessageTypes.Notice:
           case MessageTypes.None:
-          case MessageTypes.Reply:
             localizedBody = body;
             break;
         }
@@ -660,9 +681,130 @@ class Event extends MatrixEvent {
 
   static const Set<String> textOnlyMessageTypes = {
     MessageTypes.Text,
-    MessageTypes.Reply,
     MessageTypes.Notice,
     MessageTypes.Emote,
     MessageTypes.None,
   };
+
+  /// returns if this event matches the passed event or transaction id
+  bool matchesEventOrTransactionId(String search) {
+    if (search == null) {
+      return false;
+    }
+    if (eventId == search) {
+      return true;
+    }
+    return unsigned != null && unsigned['transaction_id'] == search;
+  }
+
+  /// Get the relationship type of an event. `null` if there is none
+  String get relationshipType {
+    if (content == null || !(content['m.relates_to'] is Map)) {
+      return null;
+    }
+    if (content['m.relates_to'].containsKey('rel_type')) {
+      return content['m.relates_to']['rel_type'];
+    }
+    if (content['m.relates_to'].containsKey('m.in_reply_to')) {
+      return RelationshipTypes.Reply;
+    }
+    return null;
+  }
+
+  /// Get the event ID that this relationship will reference. `null` if there is none
+  String get relationshipEventId {
+    if (content == null || !(content['m.relates_to'] is Map)) {
+      return null;
+    }
+    if (content['m.relates_to'].containsKey('event_id')) {
+      return content['m.relates_to']['event_id'];
+    }
+    if (content['m.relates_to']['m.in_reply_to'] is Map &&
+        content['m.relates_to']['m.in_reply_to'].containsKey('event_id')) {
+      return content['m.relates_to']['m.in_reply_to']['event_id'];
+    }
+    return null;
+  }
+
+  /// Get wether this event has aggregated events from a certain [type]
+  /// To be able to do that you need to pass a [timeline]
+  bool hasAggregatedEvents(Timeline timeline, String type) =>
+      timeline.aggregatedEvents.containsKey(eventId) &&
+      timeline.aggregatedEvents[eventId].containsKey(type);
+
+  /// Get all the aggregated event objects for a given [type]. To be able to do this
+  /// you have to pass a [timeline]
+  Set<Event> aggregatedEvents(Timeline timeline, String type) =>
+      hasAggregatedEvents(timeline, type)
+          ? timeline.aggregatedEvents[eventId][type]
+          : <Event>{};
+
+  /// Fetches the event to be rendered, taking into account all the edits and the like.
+  /// It needs a [timeline] for that.
+  Event getDisplayEvent(Timeline timeline) {
+    if (hasAggregatedEvents(timeline, RelationshipTypes.Edit)) {
+      // alright, we have an edit
+      final allEditEvents = aggregatedEvents(timeline, RelationshipTypes.Edit)
+          // we only allow edits made by the original author themself
+          .where((e) => e.senderId == senderId && e.type == EventTypes.Message)
+          .toList();
+      // we need to check again if it isn't empty, as we potentially removed all
+      // aggregated edits
+      if (allEditEvents.isNotEmpty) {
+        allEditEvents.sort((a, b) => a.sortOrder - b.sortOrder > 0 ? 1 : -1);
+        var rawEvent = allEditEvents.last.toJson();
+        // update the content of the new event to render
+        if (rawEvent['content']['m.new_content'] is Map) {
+          rawEvent['content'] = rawEvent['content']['m.new_content'];
+        }
+        return Event.fromJson(rawEvent, room);
+      }
+    }
+    return this;
+  }
+
+  /// returns if a message is a rich message
+  bool get isRichMessage =>
+      content['format'] == 'org.matrix.custom.html' &&
+      content['formatted_body'] is String;
+
+  // regexes to fetch the number of emotes, including emoji, and if the message consists of only those
+  // to match an emoji we can use the following regex:
+  // (?:\x{00a9}|\x{00ae}|[\x{2000}-\x{3300}]|\x{d83c}[\x{d000}-\x{dfff}]|\x{d83d}[\x{d000}-\x{dfff}]|\x{d83e}[\x{d000}-\x{dfff}])[\x{fe00}-\x{fe0f}]?
+  // we need to replace \x{0000} with \u0000, the comment is left in the other format to be able to paste into regex101.com
+  // to see if there is a custom emote, we use the following regex: <img[^>]+data-mx-(?:emote|emoticon)(?==|>|\s)[^>]*>
+  // now we combind the two to have four regexes:
+  // 1. are there only emoji, or whitespace
+  // 2. are there only emoji, emotes, or whitespace
+  // 3. count number of emoji
+  // 4- count number of emoji or emotes
+  static final RegExp _onlyEmojiRegex = RegExp(
+      r'^((?:\u00a9|\u00ae|[\u2000-\u3300]|\ud83c[\ud000-\udfff]|\ud83d[\ud000-\udfff]|\ud83e[\ud000-\udfff])[\ufe00-\ufe0f]?|\s)*$',
+      caseSensitive: false,
+      multiLine: false);
+  static final RegExp _onlyEmojiEmoteRegex = RegExp(
+      r'^((?:\u00a9|\u00ae|[\u2000-\u3300]|\ud83c[\ud000-\udfff]|\ud83d[\ud000-\udfff]|\ud83e[\ud000-\udfff])[\ufe00-\ufe0f]?|<img[^>]+data-mx-(?:emote|emoticon)(?==|>|\s)[^>]*>|\s)*$',
+      caseSensitive: false,
+      multiLine: false);
+  static final RegExp _countEmojiRegex = RegExp(
+      r'((?:\u00a9|\u00ae|[\u2000-\u3300]|\ud83c[\ud000-\udfff]|\ud83d[\ud000-\udfff]|\ud83e[\ud000-\udfff])[\ufe00-\ufe0f]?)',
+      caseSensitive: false,
+      multiLine: false);
+  static final RegExp _countEmojiEmoteRegex = RegExp(
+      r'((?:\u00a9|\u00ae|[\u2000-\u3300]|\ud83c[\ud000-\udfff]|\ud83d[\ud000-\udfff]|\ud83e[\ud000-\udfff])[\ufe00-\ufe0f]?|<img[^>]+data-mx-(?:emote|emoticon)(?==|>|\s)[^>]*>)',
+      caseSensitive: false,
+      multiLine: false);
+
+  /// Returns if a given event only has emotes, emojis or whitespace as content.
+  /// This is useful to determine if stand-alone emotes should be displayed bigger.
+  bool get onlyEmotes => isRichMessage
+      ? _onlyEmojiEmoteRegex.hasMatch(content['formatted_body'])
+      : _onlyEmojiRegex.hasMatch(content['body'] ?? '');
+
+  /// Gets the number of emotes in a given message. This is useful to determine if
+  /// emotes should be displayed bigger. WARNING: This does **not** test if there are
+  /// only emotes. Use `event.onlyEmotes` for that!
+  int get numberEmotes => isRichMessage
+      ? _countEmojiEmoteRegex.allMatches(content['formatted_body']).length
+      : _countEmojiRegex.allMatches(content['body'] ?? '').length;
 }

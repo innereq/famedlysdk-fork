@@ -1,13 +1,50 @@
-import 'package:moor/moor.dart';
+import 'dart:async';
 import 'dart:convert';
 
-import 'package:famedlysdk/famedlysdk.dart' as sdk;
-import 'package:famedlysdk/matrix_api.dart' as api;
+import 'package:moor/moor.dart';
 import 'package:olm/olm.dart' as olm;
 
+import '../../famedlysdk.dart' as sdk;
+import '../../matrix_api.dart' as api;
 import '../../matrix_api.dart';
+import '../client.dart';
+import '../room.dart';
+import '../utils/logs.dart';
 
 part 'database.g.dart';
+
+extension MigratorExtension on Migrator {
+  Future<void> createIndexIfNotExists(Index index) async {
+    try {
+      await createIndex(index);
+    } catch (err) {
+      if (!err.toString().toLowerCase().contains('already exists')) {
+        rethrow;
+      }
+    }
+  }
+
+  Future<void> createTableIfNotExists(TableInfo<Table, DataClass> table) async {
+    try {
+      await createTable(table);
+    } catch (err) {
+      if (!err.toString().toLowerCase().contains('already exists')) {
+        rethrow;
+      }
+    }
+  }
+
+  Future<void> addColumnIfNotExists(
+      TableInfo<Table, DataClass> table, GeneratedColumn column) async {
+    try {
+      await addColumn(table, column);
+    } catch (err) {
+      if (!err.toString().toLowerCase().contains('duplicate column name')) {
+        rethrow;
+      }
+    }
+  }
+}
 
 @UseMoor(
   include: {'database.moor'},
@@ -18,56 +55,87 @@ class Database extends _$Database {
   Database.connect(DatabaseConnection connection) : super.connect(connection);
 
   @override
-  int get schemaVersion => 5;
+  int get schemaVersion => 6;
 
   int get maxFileSize => 1 * 1024 * 1024;
 
+  /// Update errors are coming here.
+  final StreamController<SdkError> onError = StreamController.broadcast();
+
   @override
   MigrationStrategy get migration => MigrationStrategy(
-        onCreate: (Migrator m) {
-          return m.createAll();
+        onCreate: (Migrator m) async {
+          try {
+            await m.createAll();
+          } catch (e, s) {
+            Logs.error(e, s);
+            onError.add(SdkError(exception: e, stackTrace: s));
+            rethrow;
+          }
         },
         onUpgrade: (Migrator m, int from, int to) async {
-          // this appears to be only called once, so multiple consecutive upgrades have to be handled appropriately in here
-          if (from == 1) {
-            await m.createIndex(userDeviceKeysIndex);
-            await m.createIndex(userDeviceKeysKeyIndex);
-            await m.createIndex(olmSessionsIndex);
-            await m.createIndex(outboundGroupSessionsIndex);
-            await m.createIndex(inboundGroupSessionsIndex);
-            await m.createIndex(roomsIndex);
-            await m.createIndex(eventsIndex);
-            await m.createIndex(roomStatesIndex);
-            await m.createIndex(accountDataIndex);
-            await m.createIndex(roomAccountDataIndex);
-            await m.createIndex(presencesIndex);
-            from++;
-          }
-          if (from == 2) {
-            await m.deleteTable('outbound_group_sessions');
-            await m.createTable(outboundGroupSessions);
-            from++;
-          }
-          if (from == 3) {
-            await m.createTable(userCrossSigningKeys);
-            await m.createTable(ssssCache);
-            // mark all keys as outdated so that the cross signing keys will be fetched
-            await m.issueCustomQuery(
-                'UPDATE user_device_keys SET outdated = true');
-            from++;
-          }
-          if (from == 4) {
-            await m.addColumn(olmSessions, olmSessions.lastReceived);
-            from++;
+          try {
+            // this appears to be only called once, so multiple consecutive upgrades have to be handled appropriately in here
+            if (from == 1) {
+              await m.createIndexIfNotExists(userDeviceKeysIndex);
+              await m.createIndexIfNotExists(userDeviceKeysKeyIndex);
+              await m.createIndexIfNotExists(olmSessionsIndex);
+              await m.createIndexIfNotExists(outboundGroupSessionsIndex);
+              await m.createIndexIfNotExists(inboundGroupSessionsIndex);
+              await m.createIndexIfNotExists(roomsIndex);
+              await m.createIndexIfNotExists(eventsIndex);
+              await m.createIndexIfNotExists(roomStatesIndex);
+              await m.createIndexIfNotExists(accountDataIndex);
+              await m.createIndexIfNotExists(roomAccountDataIndex);
+              await m.createIndexIfNotExists(presencesIndex);
+              from++;
+            }
+            if (from == 2) {
+              await m.deleteTable('outbound_group_sessions');
+              await m.createTable(outboundGroupSessions);
+              from++;
+            }
+            if (from == 3) {
+              await m.createTableIfNotExists(userCrossSigningKeys);
+              await m.createTableIfNotExists(ssssCache);
+              // mark all keys as outdated so that the cross signing keys will be fetched
+              await customStatement(
+                  'UPDATE user_device_keys SET outdated = true');
+              from++;
+            }
+            if (from == 4) {
+              await m.addColumnIfNotExists(
+                  olmSessions, olmSessions.lastReceived);
+              from++;
+            }
+            if (from == 5) {
+              await m.addColumnIfNotExists(
+                  inboundGroupSessions, inboundGroupSessions.uploaded);
+              await m.addColumnIfNotExists(
+                  inboundGroupSessions, inboundGroupSessions.senderKey);
+              await m.addColumnIfNotExists(
+                  inboundGroupSessions, inboundGroupSessions.senderClaimedKeys);
+              from++;
+            }
+          } catch (e, s) {
+            Logs.error(e, s);
+            onError.add(SdkError(exception: e, stackTrace: s));
+            rethrow;
           }
         },
         beforeOpen: (_) async {
-          if (executor.dialect == SqlDialect.sqlite) {
-            final ret = await customSelect('PRAGMA journal_mode=WAL').get();
-            if (ret.isNotEmpty) {
-              print('[Moor] Switched database to mode ' +
-                  ret.first.data['journal_mode'].toString());
+          try {
+            if (executor.dialect == SqlDialect.sqlite) {
+              final ret = await customSelect('PRAGMA journal_mode=WAL').get();
+              if (ret.isNotEmpty) {
+                Logs.info('[Moor] Switched database to mode ' +
+                    ret.first.data['journal_mode'].toString());
+              }
             }
+          } catch (e, s) {
+            Logs.error(e, s);
+            onError.add(SdkError(exception: e, stackTrace: s));
+            rethrow;
           }
         },
       );
@@ -75,6 +143,7 @@ class Database extends _$Database {
   Future<DbClient> getClient(String name) async {
     final res = await dbGetClient(name).get();
     if (res.isEmpty) return null;
+    await markPendingEventsAsError(res.first.clientId);
     return res.first;
   }
 
@@ -112,8 +181,9 @@ class Database extends _$Database {
         var session = olm.Session();
         session.unpickle(userId, row.pickle);
         res[row.identityKey].add(session);
-      } catch (e) {
-        print('[LibOlm] Could not unpickle olm session: ' + e.toString());
+      } catch (e, s) {
+        Logs.error(
+            '[LibOlm] Could not unpickle olm session: ' + e.toString(), s);
       }
     }
     return res;
@@ -329,7 +399,7 @@ class Database extends _$Database {
     // Is the timeline limited? Then all previous messages should be
     // removed from the database!
     if (roomUpdate.limitedTimeline) {
-      await removeRoomEvents(clientId, roomUpdate.id);
+      await removeSuccessfulRoomEvents(clientId, roomUpdate.id);
       await updateRoomSortOrder(0.0, 0.0, clientId, roomUpdate.id);
       await setRoomPrevBatch(roomUpdate.prev_batch, clientId, roomUpdate.id);
     }
@@ -357,14 +427,50 @@ class Database extends _$Database {
     if (type == 'timeline' || type == 'history') {
       // calculate the status
       var status = 2;
+      if (eventContent['unsigned'] is Map<String, dynamic> &&
+          eventContent['unsigned'][MessageSendingStatusKey] is num) {
+        status = eventContent['unsigned'][MessageSendingStatusKey];
+      }
       if (eventContent['status'] is num) status = eventContent['status'];
-      if ((status == 1 || status == -1) &&
+      var storeNewEvent = !((status == 1 || status == -1) &&
           eventContent['unsigned'] is Map<String, dynamic> &&
-          eventContent['unsigned']['transaction_id'] is String) {
-        // status changed and we have an old transaction id --> update event id and stuffs
-        await updateEventStatus(status, eventContent['event_id'], clientId,
-            eventContent['unsigned']['transaction_id'], chatId);
-      } else {
+          eventContent['unsigned']['transaction_id'] is String);
+      if (!storeNewEvent) {
+        final allOldEvents =
+            await getEvent(clientId, eventContent['event_id'], chatId).get();
+        if (allOldEvents.isNotEmpty) {
+          // we were likely unable to change transaction_id -> event_id.....because the event ID already exists!
+          // So, we try to fetch the old event
+          // the transaction id event will automatically be deleted further down
+          final oldEvent = allOldEvents.first;
+          // do we update the status? We should allow 0 -> -1 updates and status increases
+          if (status > oldEvent.status ||
+              (oldEvent.status == 0 && status == -1)) {
+            // update the status
+            await updateEventStatusOnly(
+                status, clientId, eventContent['event_id'], chatId);
+          }
+        } else {
+          // status changed and we have an old transaction id --> update event id and stuffs
+          try {
+            final updated = await updateEventStatus(
+                status,
+                eventContent['event_id'],
+                clientId,
+                eventContent['unsigned']['transaction_id'],
+                chatId);
+            if (updated == 0) {
+              storeNewEvent = true;
+            }
+          } catch (err) {
+            // we could not update the transaction id to the event id....so it already exists
+            // as we just tried to fetch the event previously this is a race condition if the event comes down sync in the mean time
+            // that means that the status we already have in the database is likely more accurate
+            // than our status. So, we just ignore this error
+          }
+        }
+      }
+      if (storeNewEvent) {
         DbEvent oldEvent;
         if (type == 'history') {
           final allOldEvents =
@@ -394,6 +500,7 @@ class Database extends _$Database {
 
       // is there a transaction id? Then delete the event with this id.
       if (status != -1 &&
+          status != 0 &&
           eventUpdate.content['unsigned'] is Map &&
           eventUpdate.content['unsigned']['transaction_id'] is String) {
         await removeEvent(clientId,

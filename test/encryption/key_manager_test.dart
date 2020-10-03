@@ -17,6 +17,7 @@
  */
 
 import 'package:famedlysdk/famedlysdk.dart';
+import 'package:famedlysdk/src/utils/logs.dart';
 import 'package:test/test.dart';
 import 'package:olm/olm.dart' as olm;
 
@@ -30,9 +31,9 @@ void main() {
       olm.Account();
     } catch (_) {
       olmEnabled = false;
-      print('[LibOlm] Failed to load LibOlm: ' + _.toString());
+      Logs.warning('[LibOlm] Failed to load LibOlm: ' + _.toString());
     }
-    print('[LibOlm] Enabled: $olmEnabled');
+    Logs.success('[LibOlm] Enabled: $olmEnabled');
 
     if (!olmEnabled) return;
 
@@ -59,7 +60,7 @@ void main() {
             'session_key': sessionKey,
           },
           encryptedContent: {
-            'sender_key': validSessionId,
+            'sender_key': validSenderKey,
           });
       await client.encryption.keyManager.handleToDeviceEvent(event);
       expect(
@@ -184,6 +185,11 @@ void main() {
                   .getInboundGroupSession(roomId, sessionId, senderKey) !=
               null,
           true);
+      expect(
+          client.encryption.keyManager
+                  .getInboundGroupSession(roomId, sessionId, 'invalid') !=
+              null,
+          false);
 
       expect(
           client.encryption.keyManager
@@ -195,6 +201,11 @@ void main() {
                   .getInboundGroupSession('otherroom', sessionId, senderKey) !=
               null,
           true);
+      expect(
+          client.encryption.keyManager
+                  .getInboundGroupSession('otherroom', sessionId, 'invalid') !=
+              null,
+          false);
       expect(
           client.encryption.keyManager
                   .getInboundGroupSession('otherroom', 'invalid', senderKey) !=
@@ -214,6 +225,20 @@ void main() {
                   .getInboundGroupSession(roomId, sessionId, senderKey) !=
               null,
           true);
+
+      client.encryption.keyManager.clearInboundGroupSessions();
+      expect(
+          client.encryption.keyManager
+                  .getInboundGroupSession(roomId, sessionId, senderKey) !=
+              null,
+          false);
+      await client.encryption.keyManager
+          .loadInboundGroupSession(roomId, sessionId, 'invalid');
+      expect(
+          client.encryption.keyManager
+                  .getInboundGroupSession(roomId, sessionId, 'invalid') !=
+              null,
+          false);
     });
 
     test('setInboundGroupSession', () async {

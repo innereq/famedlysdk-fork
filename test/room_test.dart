@@ -27,7 +27,9 @@ import 'package:famedlysdk/src/database/database.dart'
 import 'package:test/test.dart';
 
 import 'fake_client.dart';
+import 'fake_matrix_api.dart';
 
+import 'dart:convert';
 import 'dart:typed_data';
 
 void main() {
@@ -179,10 +181,6 @@ void main() {
 
     test('sendReadReceipt', () async {
       await room.sendReadReceipt('§1234:fakeServer.notExisting');
-    });
-
-    test('enableEncryption', () async {
-      await room.enableEncryption();
     });
 
     test('requestParticipants', () async {
@@ -349,9 +347,106 @@ void main() {
     });
 
     test('sendEvent', () async {
+      FakeMatrixApi.calledEndpoints.clear();
       final dynamic resp =
           await room.sendTextEvent('Hello world', txid: 'testtxid');
       expect(resp.startsWith('\$event'), true);
+      final entry = FakeMatrixApi.calledEndpoints.entries
+          .firstWhere((p) => p.key.contains('/send/m.room.message/'));
+      final content = json.decode(entry.value.first);
+      expect(content, {
+        'body': 'Hello world',
+        'msgtype': 'm.text',
+      });
+    });
+
+    test('send edit', () async {
+      FakeMatrixApi.calledEndpoints.clear();
+      final dynamic resp = await room.sendTextEvent('Hello world',
+          txid: 'testtxid', editEventId: '\$otherEvent');
+      expect(resp.startsWith('\$event'), true);
+      final entry = FakeMatrixApi.calledEndpoints.entries
+          .firstWhere((p) => p.key.contains('/send/m.room.message/'));
+      final content = json.decode(entry.value.first);
+      expect(content, {
+        'body': '* Hello world',
+        'msgtype': 'm.text',
+        'm.new_content': {
+          'body': 'Hello world',
+          'msgtype': 'm.text',
+        },
+        'm.relates_to': {
+          'event_id': '\$otherEvent',
+          'rel_type': 'm.replace',
+        },
+      });
+    });
+
+    test('send reply', () async {
+      var event = Event.fromJson({
+        'event_id': '\$replyEvent',
+        'content': {
+          'body': 'Blah',
+          'msgtype': 'm.text',
+        },
+        'type': 'm.room.message',
+        'sender': '@alice:example.org',
+      }, room);
+      FakeMatrixApi.calledEndpoints.clear();
+      final dynamic resp = await room.sendTextEvent('Hello world',
+          txid: 'testtxid', inReplyTo: event);
+      expect(resp.startsWith('\$event'), true);
+      final entry = FakeMatrixApi.calledEndpoints.entries
+          .firstWhere((p) => p.key.contains('/send/m.room.message/'));
+      final content = json.decode(entry.value.first);
+      expect(content, {
+        'body': '> <@alice:example.org> Blah\n\nHello world',
+        'msgtype': 'm.text',
+        'format': 'org.matrix.custom.html',
+        'formatted_body':
+            '<mx-reply><blockquote><a href="https://matrix.to/#/!localpart:server.abc/\$replyEvent">In reply to</a> <a href="https://matrix.to/#/@alice:example.org">@alice:example.org</a><br>Blah</blockquote></mx-reply>Hello world',
+        'm.relates_to': {
+          'm.in_reply_to': {
+            'event_id': '\$replyEvent',
+          },
+        },
+      });
+    });
+
+    test('send reaction', () async {
+      FakeMatrixApi.calledEndpoints.clear();
+      final dynamic resp =
+          await room.sendReaction('\$otherEvent', '🦊', txid: 'testtxid');
+      expect(resp.startsWith('\$event'), true);
+      final entry = FakeMatrixApi.calledEndpoints.entries
+          .firstWhere((p) => p.key.contains('/send/m.reaction/'));
+      final content = json.decode(entry.value.first);
+      expect(content, {
+        'm.relates_to': {
+          'event_id': '\$otherEvent',
+          'rel_type': 'm.annotation',
+          'key': '🦊',
+        },
+      });
+    });
+
+    test('send location', () async {
+      FakeMatrixApi.calledEndpoints.clear();
+
+      final body = 'Middle of the ocean';
+      final geoUri = 'geo:0.0,0.0';
+      final dynamic resp =
+          await room.sendLocation(body, geoUri, txid: 'testtxid');
+      expect(resp.startsWith('\$event'), true);
+
+      final entry = FakeMatrixApi.calledEndpoints.entries
+          .firstWhere((p) => p.key.contains('/send/m.room.message/'));
+      final content = json.decode(entry.value.first);
+      expect(content, {
+        'msgtype': 'm.location',
+        'body': body,
+        'geo_uri': geoUri,
+      });
     });
 
     // Not working because there is no real file to test it...
@@ -373,6 +468,17 @@ void main() {
       matrix.accountData['m.push_rules'].content['global']['override']
           .add(matrix.accountData['m.push_rules'].content['global']['room'][0]);
       expect(room.pushRuleState, PushRuleState.dont_notify);
+    });
+
+    test('Test call methods', () async {
+      await room.inviteToCall('1234', 1234, 'sdp', txid: '1234');
+      await room.answerCall('1234', 'sdp', txid: '1234');
+      await room.hangupCall('1234', txid: '1234');
+      await room.sendCallCandidates('1234', [], txid: '1234');
+    });
+
+    test('enableEncryption', () async {
+      await room.enableEncryption();
     });
 
     test('Enable encryption', () async {
@@ -400,13 +506,6 @@ void main() {
       await room.setPushRuleState(PushRuleState.dont_notify);
       await room.setPushRuleState(PushRuleState.mentions_only);
       await room.setPushRuleState(PushRuleState.notify);
-    });
-
-    test('Test call methods', () async {
-      await room.inviteToCall('1234', 1234, 'sdp', txid: '1234');
-      await room.answerCall('1234', 'sdp', txid: '1234');
-      await room.hangupCall('1234', txid: '1234');
-      await room.sendCallCandidates('1234', [], txid: '1234');
     });
 
     test('Test tag methods', () async {
