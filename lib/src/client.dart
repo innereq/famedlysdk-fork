@@ -1597,10 +1597,14 @@ sort order of ${prevState.sortOrder}. This should never happen...''');
     } catch (_) {
       // No-OP
     }
-    if (closeDatabase) await database?.close();
-    database = null;
     encryption?.dispose();
     encryption = null;
+    try {
+      if (closeDatabase) await database?.close();
+    } catch (error, stacktrace) {
+      Logs.warning('Failed to close database: ' + error.toString(), stacktrace);
+    }
+    database = null;
     return;
   }
 }
