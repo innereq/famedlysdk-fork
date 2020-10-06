@@ -222,7 +222,7 @@ class Client extends MatrixApi {
   ) async {
     final response = await http
         .get('https://${MatrixIdOrDomain.domain}/.well-known/matrix/client');
-    WellKnownInformations wellKnown = WellKnownInformations.fromJson(json.decode(response.body));
+    var wellKnown = WellKnownInformations.fromJson(json.decode(response.body));
     if (Uri.parse(wellKnown.mHomeserver.baseUrl).host != MatrixIdOrDomain.domain) {
       final response = await http
         .get('https://${Uri.parse(wellKnown.mHomeserver.baseUrl).host}/.well-known/matrix/client');
@@ -232,10 +232,10 @@ class Client extends MatrixApi {
   }
 
   Future<WellKnownInformations> getWellKnownInformationsByDomain(dynamic serverUrl) async {
-    Uri homeserver = (serverUrl is Uri) ? serverUrl : Uri.parse(serverUrl);
+    var homeserver = (serverUrl is Uri) ? serverUrl : Uri.parse(serverUrl);
     final response = await http
         .get('https://${homeserver.host}/.well-known/matrix/client');
-    WellKnownInformations wellKnown = WellKnownInformations.fromJson(json.decode(response.body));
+    var wellKnown = WellKnownInformations.fromJson(json.decode(response.body));
     if (Uri.parse(wellKnown.mHomeserver.baseUrl).host != homeserver.host) {
       final response = await http
         .get('https://${Uri.parse(wellKnown.mHomeserver.baseUrl).host}/.well-known/matrix/client');
