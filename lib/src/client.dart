@@ -225,11 +225,14 @@ class Client extends MatrixApi {
     var wellKnown = WellKnownInformations.fromJson(json.decode(response.body));
     if (Uri.parse(wellKnown.mHomeserver.baseUrl).host !=
         MatrixIdOrDomain.domain) {
-      final response = await http.get(
-          'https://${Uri.parse(wellKnown.mHomeserver.baseUrl).host}/.well-known/matrix/client');
-      if (response.statusCode == 200) {
-        wellKnown = WellKnownInformations.fromJson(json.decode(response.body));
-      }
+      try {
+        final response = await http.get(
+            'https://${Uri.parse(wellKnown.mHomeserver.baseUrl).host}/.well-known/matrix/client');
+        if (response.statusCode == 200) {
+          wellKnown =
+              WellKnownInformations.fromJson(json.decode(response.body));
+        }
+      } catch (_) {}
     }
     return wellKnown;
   }
@@ -241,11 +244,14 @@ class Client extends MatrixApi {
         await http.get('https://${homeserver.host}/.well-known/matrix/client');
     var wellKnown = WellKnownInformations.fromJson(json.decode(response.body));
     if (Uri.parse(wellKnown.mHomeserver.baseUrl).host != homeserver.host) {
-      final response = await http.get(
-          'https://${Uri.parse(wellKnown.mHomeserver.baseUrl).host}/.well-known/matrix/client');
-      if (response.statusCode == 200) {
-        wellKnown = WellKnownInformations.fromJson(json.decode(response.body));
-      }
+      try {
+        final response = await http.get(
+            'https://${Uri.parse(wellKnown.mHomeserver.baseUrl).host}/.well-known/matrix/client');
+        if (response.statusCode == 200) {
+          wellKnown =
+              WellKnownInformations.fromJson(json.decode(response.body));
+        }
+      } catch (_) {}
     }
     return wellKnown;
   }
