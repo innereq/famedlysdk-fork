@@ -30,7 +30,10 @@ class WellKnownInformations {
     mIdentityServer = json['m.identity_server'] != null
         ? MHomeserver.fromJson(json['m.identity_server'])
         : null;
-    jitsiHomeserver = json['im.vector.riot.jitsi'] != null 
+    jitsiHomeserver = json['io.element.jitsi'] != null
+        ? JitsiHomeserver.fromJson(json['io.element.jitsi'])
+        : null;
+    jitsiHomeserver ??= json['im.vector.riot.jitsi'] != null
         ? JitsiHomeserver.fromJson(json['im.vector.riot.jitsi'])
         : null;
   }
