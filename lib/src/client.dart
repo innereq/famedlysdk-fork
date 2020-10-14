@@ -223,27 +223,32 @@ class Client extends MatrixApi {
     final response = await http
         .get('https://${MatrixIdOrDomain.domain}/.well-known/matrix/client');
     var wellKnown = WellKnownInformations.fromJson(json.decode(response.body));
-    if (Uri.parse(wellKnown.mHomeserver.baseUrl).host != MatrixIdOrDomain.domain) {
-      final response = await http
-        .get('https://${Uri.parse(wellKnown.mHomeserver.baseUrl).host}/.well-known/matrix/client');
-      wellKnown = WellKnownInformations.fromJson(json.decode(response.body));
+    if (Uri.parse(wellKnown.mHomeserver.baseUrl).host !=
+        MatrixIdOrDomain.domain) {
+      final response = await http.get(
+          'https://${Uri.parse(wellKnown.mHomeserver.baseUrl).host}/.well-known/matrix/client');
+      if (response.statusCode == 200) {
+        wellKnown = WellKnownInformations.fromJson(json.decode(response.body));
+      }
     }
     return wellKnown;
   }
 
-  Future<WellKnownInformations> getWellKnownInformationsByDomain(dynamic serverUrl) async {
+  Future<WellKnownInformations> getWellKnownInformationsByDomain(
+      dynamic serverUrl) async {
     var homeserver = (serverUrl is Uri) ? serverUrl : Uri.parse(serverUrl);
-    final response = await http
-        .get('https://${homeserver.host}/.well-known/matrix/client');
+    final response =
+        await http.get('https://${homeserver.host}/.well-known/matrix/client');
     var wellKnown = WellKnownInformations.fromJson(json.decode(response.body));
     if (Uri.parse(wellKnown.mHomeserver.baseUrl).host != homeserver.host) {
-      final response = await http
-        .get('https://${Uri.parse(wellKnown.mHomeserver.baseUrl).host}/.well-known/matrix/client');
-      wellKnown = WellKnownInformations.fromJson(json.decode(response.body));
-    } 
+      final response = await http.get(
+          'https://${Uri.parse(wellKnown.mHomeserver.baseUrl).host}/.well-known/matrix/client');
+      if (response.statusCode == 200) {
+        wellKnown = WellKnownInformations.fromJson(json.decode(response.body));
+      }
+    }
     return wellKnown;
   }
-
 
   /// Checks the supported versions of the Matrix protocol and the supported
   /// login types. Returns false if the server is not compatible with the
