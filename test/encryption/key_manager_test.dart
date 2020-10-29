@@ -16,6 +16,8 @@
  *   along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+import 'dart:convert';
+
 import 'package:famedlysdk/famedlysdk.dart';
 import 'package:famedlysdk/src/utils/logs.dart';
 import 'package:test/test.dart';
@@ -100,7 +102,7 @@ void main() {
       expect(
           client.encryption.keyManager.getOutboundGroupSession(roomId) != null,
           true);
-      await client.encryption.keyManager.clearOutboundGroupSession(roomId);
+      await client.encryption.keyManager.clearOrUseOutboundGroupSession(roomId);
       expect(
           client.encryption.keyManager.getOutboundGroupSession(roomId) != null,
           true);
@@ -112,17 +114,17 @@ void main() {
 
       // rotate after too many messages
       sess.sentMessages = 300;
-      await client.encryption.keyManager.clearOutboundGroupSession(roomId);
+      await client.encryption.keyManager.clearOrUseOutboundGroupSession(roomId);
       expect(
           client.encryption.keyManager.getOutboundGroupSession(roomId) != null,
           false);
 
-      // rotate if devices in room change
+      // rotate if device is blocked
       sess =
           await client.encryption.keyManager.createOutboundGroupSession(roomId);
       client.userDeviceKeys['@alice:example.com'].deviceKeys['JLAFKJWSCS']
           .blocked = true;
-      await client.encryption.keyManager.clearOutboundGroupSession(roomId);
+      await client.encryption.keyManager.clearOrUseOutboundGroupSession(roomId);
       expect(
           client.encryption.keyManager.getOutboundGroupSession(roomId) != null,
           false);
@@ -133,16 +135,61 @@ void main() {
       sess =
           await client.encryption.keyManager.createOutboundGroupSession(roomId);
       sess.creationTime = DateTime.now().subtract(Duration(days: 30));
-      await client.encryption.keyManager.clearOutboundGroupSession(roomId);
+      await client.encryption.keyManager.clearOrUseOutboundGroupSession(roomId);
       expect(
           client.encryption.keyManager.getOutboundGroupSession(roomId) != null,
           false);
+
+      // rotate if user leaves
+      sess =
+          await client.encryption.keyManager.createOutboundGroupSession(roomId);
+      final room = client.getRoomById(roomId);
+      final member = room.getState('m.room.member', '@alice:example.com');
+      member.content['membership'] = 'leave';
+      room.mJoinedMemberCount--;
+      await client.encryption.keyManager.clearOrUseOutboundGroupSession(roomId);
+      expect(
+          client.encryption.keyManager.getOutboundGroupSession(roomId) != null,
+          false);
+      member.content['membership'] = 'join';
+      room.mJoinedMemberCount++;
+
+      // do not rotate if new device is added
+      sess =
+          await client.encryption.keyManager.createOutboundGroupSession(roomId);
+      client.userDeviceKeys['@alice:example.com'].deviceKeys['NEWDEVICE'] =
+          DeviceKeys.fromJson({
+        'user_id': '@alice:example.com',
+        'device_id': 'NEWDEVICE',
+        'algorithms': ['m.olm.v1.curve25519-aes-sha2', 'm.megolm.v1.aes-sha2'],
+        'keys': {
+          'curve25519:JLAFKJWSCS':
+              '3C5BFWi2Y8MaVvjM8M22DBmh24PmgR0nPvJOIArzgyI',
+          'ed25519:JLAFKJWSCS': 'lEuiRJBit0IG6nUf5pUzWTUEsRVVe/HJkoKuEww9ULI'
+        },
+      }, client);
+      await client.encryption.keyManager.clearOrUseOutboundGroupSession(roomId);
+      expect(
+          client.encryption.keyManager.getOutboundGroupSession(roomId) != null,
+          true);
+
+      // do not rotate if new user is added
+      member.content['membership'] = 'leave';
+      room.mJoinedMemberCount--;
+      sess =
+          await client.encryption.keyManager.createOutboundGroupSession(roomId);
+      member.content['membership'] = 'join';
+      room.mJoinedMemberCount++;
+      await client.encryption.keyManager.clearOrUseOutboundGroupSession(roomId);
+      expect(
+          client.encryption.keyManager.getOutboundGroupSession(roomId) != null,
+          true);
 
       // force wipe
       sess =
           await client.encryption.keyManager.createOutboundGroupSession(roomId);
       await client.encryption.keyManager
-          .clearOutboundGroupSession(roomId, wipe: true);
+          .clearOrUseOutboundGroupSession(roomId, wipe: true);
       expect(
           client.encryption.keyManager.getOutboundGroupSession(roomId) != null,
           false);
@@ -249,6 +296,30 @@ void main() {
       final senderKey = client.identityKey;
       final roomId = '!someroom:example.org';
       final sessionId = inbound.session_id();
+      final room = Room(id: roomId, client: client);
+      client.rooms.add(room);
+      // we build up an encrypted message so that we can test if it successfully decrypted afterwards
+      room.states['m.room.encrypted'] = Event(
+        senderId: '@test:example.com',
+        type: 'm.room.encrypted',
+        roomId: room.id,
+        room: room,
+        eventId: '12345',
+        originServerTs: DateTime.now(),
+        content: {
+          'algorithm': 'm.megolm.v1.aes-sha2',
+          'ciphertext': session.encrypt(json.encode({
+            'type': 'm.room.message',
+            'content': {'msgtype': 'm.text', 'body': 'foxies'},
+          })),
+          'device_id': client.deviceID,
+          'sender_key': client.identityKey,
+          'session_id': sessionId,
+        },
+        stateKey: '',
+        sortOrder: 42.0,
+      );
+      expect(room.lastEvent.type, 'm.room.encrypted');
       // set a payload...
       var sessionPayload = <String, dynamic>{
         'algorithm': 'm.megolm.v1.aes-sha2',
@@ -378,6 +449,10 @@ void main() {
               .forwardingCurve25519KeyChain
               .length,
           0);
+
+      // test that it decrypted the last event
+      expect(room.lastEvent.type, 'm.room.message');
+      expect(room.lastEvent.content['body'], 'foxies');
 
       inbound.free();
       session.free();

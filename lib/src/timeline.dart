@@ -118,7 +118,6 @@ class Timeline {
       for (var i = 0; i < events.length; i++) {
         if (events[i].type == EventTypes.Encrypted &&
             events[i].messageType == MessageTypes.BadEncrypted &&
-            events[i].content['can_request_session'] == true &&
             events[i].content['session_id'] == sessionId) {
           events[i] = await room.client.encryption
               .decryptRoomEvent(room.id, events[i], store: true);
@@ -211,7 +210,8 @@ class Timeline {
     try {
       if (eventUpdate.roomID != room.id) return;
 
-      if (eventUpdate.type == 'timeline' || eventUpdate.type == 'history') {
+      if (eventUpdate.type == EventUpdateType.timeline ||
+          eventUpdate.type == EventUpdateType.history) {
         var status = eventUpdate.content['status'] ??
             (eventUpdate.content['unsigned'] is Map<String, dynamic>
                 ? eventUpdate.content['unsigned'][MessageSendingStatusKey]
@@ -252,7 +252,7 @@ class Timeline {
             var newEvent = Event.fromJson(
                 eventUpdate.content, room, eventUpdate.sortOrder);
 
-            if (eventUpdate.type == 'history' &&
+            if (eventUpdate.type == EventUpdateType.history &&
                 events.indexWhere(
                         (e) => e.eventId == eventUpdate.content['event_id']) !=
                     -1) return;

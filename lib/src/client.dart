@@ -256,43 +256,51 @@ class Client extends MatrixApi {
     return wellKnown;
   }
 
-  /// Checks the supported versions of the Matrix protocol and the supported
-  /// login types. Returns false if the server is not compatible with the
-  /// client.
-  /// Throws FormatException, TimeoutException and MatrixException on error.
+  @Deprecated('Use [checkHomeserver] instead.')
   Future<bool> checkServer(dynamic serverUrl) async {
     try {
-      if (serverUrl is Uri) {
-        homeserver = serverUrl;
+      await checkHomeserver(serverUrl);
+    } catch (_) {
+      return false;
+    }
+    return true;
+  }
+
+  /// Checks the supported versions of the Matrix protocol and the supported
+  /// login types. Throws an exception if the server is not compatible with the
+  /// client and sets [homeserver] to [serverUrl] if it is. Supports the types [Uri]
+  /// and [String].
+  Future<void> checkHomeserver(dynamic homeserverUrl,
+      {Set<String> supportedLoginTypes = supportedLoginTypes}) async {
+    try {
+      if (homeserverUrl is Uri) {
+        homeserver = homeserverUrl;
       } else {
         // URLs allow to have whitespace surrounding them, see https://www.w3.org/TR/2011/WD-html5-20110525/urls.html
         // As we want to strip a trailing slash, though, we have to trim the url ourself
         // and thus can't let Uri.parse() deal with it.
-        serverUrl = serverUrl.trim();
+        homeserverUrl = homeserverUrl.trim();
         // strip a trailing slash
-        if (serverUrl.endsWith('/')) {
-          serverUrl = serverUrl.substring(0, serverUrl.length - 1);
+        if (homeserverUrl.endsWith('/')) {
+          homeserverUrl = homeserverUrl.substring(0, homeserverUrl.length - 1);
         }
-        homeserver = Uri.parse(serverUrl);
+        homeserver = Uri.parse(homeserverUrl);
       }
       final versions = await requestSupportedVersions();
 
-      for (var i = 0; i < versions.versions.length; i++) {
-        if (versions.versions[i] == 'r0.5.0' ||
-            versions.versions[i] == 'r0.6.0') {
-          break;
-        } else if (i == versions.versions.length - 1) {
-          return false;
-        }
+      if (!versions.versions
+          .any((version) => supportedVersions.contains(version))) {
+        throw Exception(
+            'Server supports the versions: ${versions.versions.toString()} but this application is only compatible with ${supportedVersions.toString()}.');
       }
 
       final loginTypes = await requestLoginTypes();
-      if (loginTypes.flows.indexWhere((f) => f.type == 'm.login.password') ==
-          -1) {
-        return false;
+      if (!loginTypes.flows.any((f) => supportedLoginTypes.contains(f.type))) {
+        throw Exception(
+            'Server supports the Login Types: ${loginTypes.flows.map((f) => f.toJson).toList().toString()} but this application is only compatible with ${supportedLoginTypes.toString()}.');
       }
 
-      return true;
+      return;
     } catch (_) {
       homeserver = null;
       rethrow;
@@ -301,7 +309,7 @@ class Client extends MatrixApi {
 
   /// Checks to see if a username is available, and valid, for the server.
   /// Returns the fully-qualified Matrix user ID (MXID) that has been registered.
-  /// You have to call [checkServer] first to set a homeserver.
+  /// You have to call [checkHomeserver] first to set a homeserver.
   @override
   Future<LoginResponse> register({
     String username,
@@ -339,7 +347,7 @@ class Client extends MatrixApi {
   /// Handles the login and allows the client to call all APIs which require
   /// authentication. Returns false if the login was not successful. Throws
   /// MatrixException if login was not successful.
-  /// You have to call [checkServer] first to set a homeserver.
+  /// You have to call [checkHomeserver] first to set a homeserver.
   @override
   Future<LoginResponse> login({
     String type = 'm.login.password',
@@ -503,8 +511,11 @@ class Client extends MatrixApi {
       ? PushRuleSet.fromJson(accountData['m.push_rules'].content)
       : null;
 
-  static String syncFilters = '{"room":{"state":{"lazy_load_members":true}}}';
-  static String messagesFilters = '{"lazy_load_members":true}';
+  static const Set<String> supportedVersions = {'r0.5.0', 'r0.6.0'};
+  static const Set<String> supportedLoginTypes = {'m.login.password'};
+  static const String syncFilters =
+      '{"room":{"state":{"lazy_load_members":true}}}';
+  static const String messagesFilters = '{"lazy_load_members":true}';
   static const List<String> supportedDirectEncryptionAlgorithms = [
     'm.olm.v1.curve25519-aes-sha2'
   ];
@@ -911,14 +922,16 @@ class Client extends MatrixApi {
         if (room.state?.isNotEmpty ?? false) {
           // TODO: This method seems to be comperatively slow for some updates
           await _handleRoomEvents(
-              id, room.state.map((i) => i.toJson()).toList(), 'state');
+              id,
+              room.state.map((i) => i.toJson()).toList(),
+              EventUpdateType.state);
           handledEvents = true;
         }
         if (room.timeline?.events?.isNotEmpty ?? false) {
           await _handleRoomEvents(
               id,
               room.timeline.events.map((i) => i.toJson()).toList(),
-              sortAtTheEnd ? 'history' : 'timeline',
+              sortAtTheEnd ? EventUpdateType.history : EventUpdateType.timeline,
               sortAtTheEnd: sortAtTheEnd);
           handledEvents = true;
         }
@@ -928,30 +941,40 @@ class Client extends MatrixApi {
               id, room.ephemeral.map((i) => i.toJson()).toList());
         }
         if (room.accountData?.isNotEmpty ?? false) {
-          await _handleRoomEvents(id,
-              room.accountData.map((i) => i.toJson()).toList(), 'account_data');
+          await _handleRoomEvents(
+              id,
+              room.accountData.map((i) => i.toJson()).toList(),
+              EventUpdateType.accountData);
         }
       }
       if (room is LeftRoomUpdate) {
         if (room.timeline?.events?.isNotEmpty ?? false) {
-          await _handleRoomEvents(id,
-              room.timeline.events.map((i) => i.toJson()).toList(), 'timeline');
+          await _handleRoomEvents(
+              id,
+              room.timeline.events.map((i) => i.toJson()).toList(),
+              EventUpdateType.timeline);
           handledEvents = true;
         }
         if (room.accountData?.isNotEmpty ?? false) {
-          await _handleRoomEvents(id,
-              room.accountData.map((i) => i.toJson()).toList(), 'account_data');
+          await _handleRoomEvents(
+              id,
+              room.accountData.map((i) => i.toJson()).toList(),
+              EventUpdateType.accountData);
         }
         if (room.state?.isNotEmpty ?? false) {
           await _handleRoomEvents(
-              id, room.state.map((i) => i.toJson()).toList(), 'state');
+              id,
+              room.state.map((i) => i.toJson()).toList(),
+              EventUpdateType.state);
           handledEvents = true;
         }
       }
       if (room is InvitedRoomUpdate &&
           (room.inviteState?.isNotEmpty ?? false)) {
-        await _handleRoomEvents(id,
-            room.inviteState.map((i) => i.toJson()).toList(), 'invite_state');
+        await _handleRoomEvents(
+            id,
+            room.inviteState.map((i) => i.toJson()).toList(),
+            EventUpdateType.inviteState);
       }
       if (handledEvents && database != null && roomObj != null) {
         await roomObj.updateSortOrder();
@@ -961,7 +984,7 @@ class Client extends MatrixApi {
 
   Future<void> _handleEphemerals(String id, List<dynamic> events) async {
     for (num i = 0; i < events.length; i++) {
-      await _handleEvent(events[i], id, 'ephemeral');
+      await _handleEvent(events[i], id, EventUpdateType.ephemeral);
 
       // Receipt events are deltas between two states. We will create a
       // fake room account data event for this and store the difference
@@ -998,13 +1021,13 @@ class Client extends MatrixApi {
           }
         }
         events[i]['content'] = receiptStateContent;
-        await _handleEvent(events[i], id, 'account_data');
+        await _handleEvent(events[i], id, EventUpdateType.accountData);
       }
     }
   }
 
   Future<void> _handleRoomEvents(
-      String chat_id, List<dynamic> events, String type,
+      String chat_id, List<dynamic> events, EventUpdateType type,
       {bool sortAtTheEnd = false}) async {
     for (num i = 0; i < events.length; i++) {
       await _handleEvent(events[i], chat_id, type, sortAtTheEnd: sortAtTheEnd);
@@ -1012,7 +1035,7 @@ class Client extends MatrixApi {
   }
 
   Future<void> _handleEvent(
-      Map<String, dynamic> event, String roomID, String type,
+      Map<String, dynamic> event, String roomID, EventUpdateType type,
       {bool sortAtTheEnd = false}) async {
     if (event['type'] is String && event['content'] is Map<String, dynamic>) {
       // The client must ignore any new m.room.encryption event to prevent
@@ -1028,7 +1051,7 @@ class Client extends MatrixApi {
 
       // ephemeral events aren't persisted and don't need a sort order - they are
       // expected to be processed as soon as they come in
-      final sortOrder = type != 'ephemeral'
+      final sortOrder = type != EventUpdateType.ephemeral
           ? (sortAtTheEnd ? room.oldSortOrder : room.newSortOrder)
           : 0.0;
       var update = EventUpdate(
@@ -1051,7 +1074,7 @@ class Client extends MatrixApi {
           room.setState(user);
         }
       }
-      if (type != 'ephemeral' && database != null) {
+      if (type != EventUpdateType.ephemeral && database != null) {
         await database.storeEventUpdate(id, update);
       }
       _updateRoomsByEventUpdate(update);
@@ -1062,7 +1085,7 @@ class Client extends MatrixApi {
 
       final rawUnencryptedEvent = update.content;
 
-      if (prevBatch != null && type == 'timeline') {
+      if (prevBatch != null && type == EventUpdateType.timeline) {
         if (rawUnencryptedEvent['type'] == EventTypes.CallInvite) {
           onCallInvite
               .add(Event.fromJson(rawUnencryptedEvent, room, sortOrder));
@@ -1141,15 +1164,15 @@ class Client extends MatrixApi {
   }
 
   void _updateRoomsByEventUpdate(EventUpdate eventUpdate) {
-    if (eventUpdate.type == 'history') return;
+    if (eventUpdate.type == EventUpdateType.history) return;
 
     final room = getRoomById(eventUpdate.roomID);
     if (room == null) return;
 
     switch (eventUpdate.type) {
-      case 'timeline':
-      case 'state':
-      case 'invite_state':
+      case EventUpdateType.timeline:
+      case EventUpdateType.state:
+      case EventUpdateType.inviteState:
         var stateEvent =
             Event.fromJson(eventUpdate.content, room, eventUpdate.sortOrder);
         var prevState = room.getState(stateEvent.type, stateEvent.stateKey);
@@ -1175,13 +1198,15 @@ sort order of ${prevState.sortOrder}. This should never happen...''');
           room.setState(stateEvent);
         }
         break;
-      case 'account_data':
+      case EventUpdateType.accountData:
         room.roomAccountData[eventUpdate.eventType] =
             BasicRoomEvent.fromJson(eventUpdate.content);
         break;
-      case 'ephemeral':
+      case EventUpdateType.ephemeral:
         room.ephemerals[eventUpdate.eventType] =
             BasicRoomEvent.fromJson(eventUpdate.content);
+        break;
+      case EventUpdateType.history:
         break;
     }
     room.onUpdate.add(room.id);

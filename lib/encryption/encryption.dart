@@ -105,7 +105,7 @@ class Encryption {
   }
 
   Future<void> handleEventUpdate(EventUpdate update) async {
-    if (update.type == 'ephemeral') {
+    if (update.type == EventUpdateType.ephemeral) {
       return;
     }
     if (update.eventType.startsWith('m.key.verification.') ||
@@ -159,17 +159,7 @@ class Encryption {
       var haveIndex = inboundGroupSession.indexes.containsKey(messageIndexKey);
       if (haveIndex &&
           inboundGroupSession.indexes[messageIndexKey] != messageIndexValue) {
-        // TODO: maybe clear outbound session, if it is ours
-        // TODO: Make it so that we can't re-request the session keys, this is just for debugging
         Logs.error('[Decrypt] Could not decrypt due to a corrupted session.');
-        Logs.error('[Decrypt] Want session: $roomId $sessionId $senderKey');
-        Logs.error(
-            '[Decrypt] Have sessoin: ${inboundGroupSession.roomId} ${inboundGroupSession.sessionId} ${inboundGroupSession.senderKey}');
-        Logs.error(
-            '[Decrypt] Want indexes: $messageIndexKey $messageIndexValue');
-        Logs.error(
-            '[Decrypt] Have indexes: $messageIndexKey ${inboundGroupSession.indexes[messageIndexKey]}');
-        canRequestSession = true;
         throw (DecryptError.CHANNEL_CORRUPTED);
       }
       inboundGroupSession.indexes[messageIndexKey] = messageIndexValue;
@@ -188,13 +178,15 @@ class Encryption {
     } catch (exception) {
       // alright, if this was actually by our own outbound group session, we might as well clear it
       if (client.enableE2eeRecovery &&
+          exception != DecryptError.UNKNOWN_SESSION &&
           (keyManager
                       .getOutboundGroupSession(roomId)
                       ?.outboundGroupSession
                       ?.session_id() ??
                   '') ==
               event.content['session_id']) {
-        keyManager.clearOutboundGroupSession(roomId, wipe: true);
+        runInRoot(() =>
+            keyManager.clearOrUseOutboundGroupSession(roomId, wipe: true));
       }
       if (canRequestSession) {
         decryptedPayload = {
@@ -235,8 +227,23 @@ class Encryption {
   }
 
   Future<Event> decryptRoomEvent(String roomId, Event event,
-      {bool store = false, String updateType = 'timeline'}) async {
-    final doStore = () async {
+      {bool store = false,
+      EventUpdateType updateType = EventUpdateType.timeline}) async {
+    if (event.type != EventTypes.Encrypted) {
+      return event;
+    }
+    if (client.database != null &&
+        keyManager.getInboundGroupSession(roomId, event.content['session_id'],
+                event.content['sender_key']) ==
+            null) {
+      await keyManager.loadInboundGroupSession(
+          roomId, event.content['session_id'], event.content['sender_key']);
+    }
+    event = decryptRoomEventSync(roomId, event);
+    if (event.type != EventTypes.Encrypted && store) {
+      if (updateType != EventUpdateType.history) {
+        event.room?.setState(event);
+      }
       await client.database?.storeEventUpdate(
         client.id,
         EventUpdate(
@@ -247,28 +254,6 @@ class Encryption {
           sortOrder: event.sortOrder,
         ),
       );
-      if (updateType != 'history') {
-        event.room?.setState(event);
-      }
-    };
-    if (event.type != EventTypes.Encrypted) {
-      return event;
-    }
-    event = decryptRoomEventSync(roomId, event);
-    if (event.type != EventTypes.Encrypted) {
-      if (store) {
-        await doStore();
-      }
-      return event;
-    }
-    if (client.database == null) {
-      return event;
-    }
-    await keyManager.loadInboundGroupSession(
-        roomId, event.content['session_id'], event.content['sender_key']);
-    event = decryptRoomEventSync(roomId, event);
-    if (event.type != EventTypes.Encrypted && store) {
-      await doStore();
     }
     return event;
   }
@@ -288,7 +273,7 @@ class Encryption {
     if (keyManager.getOutboundGroupSession(roomId) == null) {
       await keyManager.loadOutboundGroupSession(roomId);
     }
-    await keyManager.clearOutboundGroupSession(roomId);
+    await keyManager.clearOrUseOutboundGroupSession(roomId);
     if (keyManager.getOutboundGroupSession(roomId) == null) {
       await keyManager.createOutboundGroupSession(roomId);
     }
@@ -314,7 +299,6 @@ class Encryption {
       'session_id': sess.outboundGroupSession.session_id(),
       if (mRelatesTo != null) 'm.relates_to': mRelatesTo,
     };
-    sess.sentMessages++;
     await keyManager.storeOutboundGroupSession(roomId, sess);
     return encryptedPayload;
   }
